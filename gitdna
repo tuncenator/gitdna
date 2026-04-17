@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""gitdna - scan a directory of git repos and build a personal commit dashboard."""
+from __future__ import annotations
+
+import argparse
+import collections
+import concurrent.futures as cf
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+NOISE_PATTERNS = [
+    r"package-lock\.json$", r"yarn\.lock$", r"pnpm-lock\.yaml$",
+    r"poetry\.lock$", r"Cargo\.lock$", r"composer\.lock$", r"Gemfile\.lock$",
+    r"go\.sum$", r"\.min\.(js|css)$", r"\.map$",
+    r"(^|/)vendor/", r"(^|/)node_modules/", r"(^|/)dist/", r"(^|/)build/",
+    r"\.svg$", r"\.png$", r"\.jpg$", r"\.jpeg$", r"\.gif$", r"\.ico$",
+    r"\.pdf$", r"\.mp4$", r"\.zip$", r"\.tar(\.gz)?$", r"\.lockb$",
+    r"\.snap$",
+]
+NOISE_RE = re.compile("|".join(NOISE_PATTERNS), re.I)
+
+
+def find_repos(root: Path, max_depth: int) -> list[Path]:
+    repos = []
+    root = root.resolve()
+    root_depth = len(root.parts)
+    for dirpath, dirnames, _ in os.walk(root):
+        d = Path(dirpath)
+        depth = len(d.parts) - root_depth
+        if depth > max_depth:
+            dirnames[:] = []
+            continue
+        if ".git" in dirnames:
+            gitpath = d / ".git"
+            if gitpath.is_dir() or gitpath.is_file():
+                repos.append(d)
+                dirnames[:] = [x for x in dirnames if x != ".git"]
+    return sorted(repos)
+
+
+def run_git(repo: Path, args: list[str], timeout: int) -> str:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo)] + args,
+            capture_output=True, text=True, timeout=timeout,
+            errors="replace",
+        )
+        return r.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def extract_repo(repo: Path, author_pattern: str, timeout: int) -> tuple[list[tuple], list[tuple]]:
+    name = repo.name
+    log = run_git(
+        repo,
+        ["log", "--all", f"--author={author_pattern}",
+         "--pretty=format:%H%x09%aI%x09%ae%x09%an%x09%s"],
+        timeout,
+    )
+    commits = []
+    for line in log.splitlines():
+        parts = line.split("\t", 4)
+        if len(parts) < 5:
+            continue
+        sha, iso, email, who, subj = parts
+        commits.append((name, sha, iso, email, who, subj))
+
+    # numstat in a second call (avoids parsing complexity, and skips merges)
+    nums = run_git(
+        repo,
+        ["log", "--all", "--no-merges", f"--author={author_pattern}",
+         "--pretty=format:C\t%H\t%aI", "--numstat"],
+        timeout,
+    )
+    loc_rows = []
+    cur_sha = cur_iso = None
+    for line in nums.splitlines():
+        if not line:
+            continue
+        if line.startswith("C\t"):
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                cur_sha, cur_iso = parts[1], parts[2]
+            continue
+        parts = line.split("\t", 2)
+        if len(parts) < 3 or cur_sha is None:
+            continue
+        a, d, path = parts
+        if a == "-" or d == "-":
+            continue
+        try:
+            add, dele = int(a), int(d)
+        except ValueError:
+            continue
+        loc_rows.append((name, cur_sha, cur_iso, add, dele, path))
+    return commits, loc_rows
+
+
+def ext_of(path: str) -> str:
+    if " => " in path:
+        path = path.split(" => ", 1)[1]
+    base = os.path.basename(path)
+    if "." in base:
+        e = base.rsplit(".", 1)[1].lower()
+        if 0 < len(e) <= 8 and e.isalnum():
+            return e
+    return "(none)"
+
+
+def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
+    # dedupe commits by sha
+    seen = set()
+    uniq = []
+    for c in commits:
+        if c[1] in seen:
+            continue
+        seen.add(c[1])
+        uniq.append(c)
+    commits = uniq
+
+    parsed = []
+    for c in commits:
+        try:
+            d = dt.datetime.fromisoformat(c[2].replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        parsed.append((c[0], c[1], d, c[3], c[4], c[5]))
+    commits = parsed
+    if not commits:
+        raise SystemExit("No commits matched. Check --author pattern.")
+
+    total = len(commits)
+    hours = [0] * 24
+    dows = [0] * 7
+    heat = [[0] * 24 for _ in range(7)]
+    months = collections.Counter()
+    years = collections.Counter()
+    repos = collections.Counter()
+    day_counter = collections.Counter()
+
+    for repo, sha, d, email, name, subj in commits:
+        hours[d.hour] += 1
+        dows[d.weekday()] += 1
+        heat[d.weekday()][d.hour] += 1
+        months[(d.year, d.month)] += 1
+        years[d.year] += 1
+        repos[repo] += 1
+        day_counter[d.date()] += 1
+
+    night = sum(hours[h] for h in range(0, 7))
+    morning = sum(hours[h] for h in range(7, 12))
+    afternoon = sum(hours[h] for h in range(12, 18))
+    evening = sum(hours[h] for h in range(18, 24))
+    weekend = dows[5] + dows[6]
+
+    top_day, top_day_count = day_counter.most_common(1)[0]
+
+    days_list = sorted(day_counter.keys())
+    max_streak = cur_streak = 1
+    best_end = days_list[0]
+    for i in range(1, len(days_list)):
+        if (days_list[i] - days_list[i-1]).days == 1:
+            cur_streak += 1
+            if cur_streak > max_streak:
+                max_streak = cur_streak
+                best_end = days_list[i]
+        else:
+            cur_streak = 1
+    streak_start = best_end - dt.timedelta(days=max_streak - 1)
+
+    times = sorted(c[2] for c in commits)
+    max_burst = 0
+    burst_start = times[0]
+    j = 0
+    for i in range(len(times)):
+        while times[i] - times[j] > dt.timedelta(hours=1):
+            j += 1
+        c = i - j + 1
+        if c > max_burst:
+            max_burst = c
+            burst_start = times[j]
+
+    longest_gap = max(
+        ((times[i] - times[i-1], times[i-1], times[i]) for i in range(1, len(times))),
+        key=lambda x: x[0],
+    )
+
+    top_repos = repos.most_common(15)
+
+    mkeys = sorted(months.keys())
+    month_labels, month_counts = [], []
+    cur = dt.date(mkeys[0][0], mkeys[0][1], 1)
+    last = dt.date(mkeys[-1][0], mkeys[-1][1], 1)
+    while cur <= last:
+        month_labels.append(f"{cur.year}-{cur.month:02d}")
+        month_counts.append(months.get((cur.year, cur.month), 0))
+        cur = dt.date(cur.year + 1, 1, 1) if cur.month == 12 else dt.date(cur.year, cur.month + 1, 1)
+
+    today = dt.date.today()
+    start365 = today - dt.timedelta(days=365)
+    daily = collections.Counter()
+    for c in commits:
+        ld = c[2].date()
+        if ld >= start365:
+            daily[ld] += 1
+    daily_labels, daily_counts = [], []
+    cur = start365
+    while cur <= today:
+        daily_labels.append(cur.isoformat())
+        daily_counts.append(daily.get(cur, 0))
+        cur += dt.timedelta(days=1)
+
+    verbs = collections.Counter()
+    for c in commits:
+        m = re.match(r"^([A-Za-z]+)", c[5].strip())
+        if m:
+            verbs[m.group(1).lower()] += 1
+    top_verbs = verbs.most_common(12)
+
+    merges = sum(1 for c in commits if c[5].lower().startswith("merge"))
+    year_items = sorted(years.items())
+
+    first = min(times)
+    last_t = max(times)
+    span_days = (last_t.date() - first.date()).days
+    active_days = len(day_counter)
+
+    # LOC
+    commit_add_raw = collections.defaultdict(int)
+    commit_del_raw = collections.defaultdict(int)
+    commit_add = collections.defaultdict(int)
+    commit_del = collections.defaultdict(int)
+    commit_meta = {}
+    ext_add = collections.Counter()
+    repo_add = collections.Counter()
+    repo_del = collections.Counter()
+
+    for repo, sha, iso, add, dele, path in loc_rows:
+        commit_add_raw[sha] += add
+        commit_del_raw[sha] += dele
+        if sha not in commit_meta:
+            try:
+                commit_meta[sha] = (repo, iso, dt.datetime.fromisoformat(iso.replace("Z", "+00:00")))
+            except ValueError:
+                continue
+        if NOISE_RE.search(path):
+            continue
+        commit_add[sha] += add
+        commit_del[sha] += dele
+        ext = ext_of(path)
+        ext_add[ext] += add
+        repo_add[repo] += add
+        repo_del[repo] += dele
+
+    total_add_raw = sum(commit_add_raw.values())
+    total_del_raw = sum(commit_del_raw.values())
+    total_add = sum(commit_add.values())
+    total_del = sum(commit_del.values())
+
+    if commit_add:
+        biggest_sha, biggest_add = max(commit_add.items(), key=lambda kv: kv[1])
+        bm = commit_meta.get(biggest_sha, (None, None, None))
+        subj_by_sha = {c[1]: c[5] for c in commits}
+        biggest = {
+            "sha": biggest_sha[:10],
+            "add": biggest_add,
+            "del": commit_del.get(biggest_sha, 0),
+            "when": bm[1] or "",
+            "repo": bm[0] or "",
+            "subject": (subj_by_sha.get(biggest_sha, "") or "")[:140],
+        }
+    else:
+        biggest = {"sha": "", "add": 0, "del": 0, "when": "", "repo": "", "subject": ""}
+
+    loc_by_month = collections.defaultdict(lambda: [0, 0])
+    loc_by_hour = [0] * 24
+    loc_by_dow = [0] * 7
+    loc_by_year = collections.defaultdict(lambda: [0, 0])
+    for sha, add in commit_add.items():
+        meta = commit_meta.get(sha)
+        if not meta:
+            continue
+        d = meta[2]
+        dele = commit_del.get(sha, 0)
+        loc_by_month[(d.year, d.month)][0] += add
+        loc_by_month[(d.year, d.month)][1] += dele
+        loc_by_hour[d.hour] += add
+        loc_by_dow[d.weekday()] += add
+        loc_by_year[d.year][0] += add
+        loc_by_year[d.year][1] += dele
+
+    loc_month_labels, loc_month_add, loc_month_del = [], [], []
+    cur = dt.date(mkeys[0][0], mkeys[0][1], 1)
+    last = dt.date(mkeys[-1][0], mkeys[-1][1], 1)
+    while cur <= last:
+        k = (cur.year, cur.month)
+        loc_month_labels.append(f"{cur.year}-{cur.month:02d}")
+        a, d_ = loc_by_month.get(k, [0, 0])
+        loc_month_add.append(a)
+        loc_month_del.append(-d_)
+        cur = dt.date(cur.year + 1, 1, 1) if cur.month == 12 else dt.date(cur.year, cur.month + 1, 1)
+
+    top_ext = sorted(ext_add.items(), key=lambda x: x[1], reverse=True)[:12]
+    top_repos_loc_pairs = sorted(repo_add.items(), key=lambda x: x[1], reverse=True)[:15]
+    top_repos_loc = [(r, a, repo_del.get(r, 0)) for r, a in top_repos_loc_pairs]
+    year_loc_items = sorted(loc_by_year.items())
+
+    return {
+        "title": title,
+        "generated": dt.datetime.now().isoformat(timespec="seconds"),
+        "total": total,
+        "repos_count": len(repos),
+        "first": first.isoformat(),
+        "last": last_t.isoformat(),
+        "span_days": span_days,
+        "active_days": active_days,
+        "avg_per_day": round(total / span_days, 2) if span_days else 0,
+        "avg_active": round(total / active_days, 2) if active_days else 0,
+        "weekend_pct": round(100 * weekend / total, 1),
+        "night_pct": round(100 * night / total, 1),
+        "morning_pct": round(100 * morning / total, 1),
+        "afternoon_pct": round(100 * afternoon / total, 1),
+        "evening_pct": round(100 * evening / total, 1),
+        "hours": hours, "dows": dows, "heat": heat,
+        "top_day": {"date": top_day.isoformat(), "count": top_day_count},
+        "streak": {"days": max_streak, "start": streak_start.isoformat(), "end": best_end.isoformat()},
+        "burst": {"count": max_burst, "start": burst_start.isoformat()},
+        "longest_gap": {"days": longest_gap[0].days, "from": longest_gap[1].isoformat(), "to": longest_gap[2].isoformat()},
+        "top_repos": top_repos,
+        "month_labels": month_labels, "month_counts": month_counts,
+        "daily_labels": daily_labels, "daily_counts": daily_counts,
+        "top_verbs": top_verbs,
+        "merges": merges,
+        "years": year_items,
+        "loc": {
+            "commits_with_data": len(commit_add_raw),
+            "total_add_raw": total_add_raw,
+            "total_del_raw": total_del_raw,
+            "total_add": total_add,
+            "total_del": total_del,
+            "net": total_add - total_del,
+            "biggest": biggest,
+            "month_labels": loc_month_labels,
+            "month_add": loc_month_add,
+            "month_del": loc_month_del,
+            "by_hour": loc_by_hour,
+            "by_dow": loc_by_dow,
+            "top_ext": top_ext,
+            "top_repos_loc": top_repos_loc,
+            "by_year": [(y, v[0], v[1]) for y, v in year_loc_items],
+        },
+    }
+
+
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>__TITLE__</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root { --bg:#0b0f14; --panel:#121821; --ink:#e7edf5; --dim:#8ea2bd; --accent:#7cc4ff; --hot:#ff6b6b; --warm:#ffb36b; --cool:#5ae0a3; --line:#1f2a39; }
+* { box-sizing:border-box }
+body { margin:0; background:var(--bg); color:var(--ink); font-family:-apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif; line-height:1.4; }
+header { padding:32px 40px 16px; border-bottom:1px solid var(--line); }
+h1 { margin:0 0 6px; font-size:28px; letter-spacing:-0.02em }
+.sub { color:var(--dim); font-size:14px }
+.section-hd { padding:28px 40px 0; color:var(--dim); font-size:12px; text-transform:uppercase; letter-spacing:0.12em; font-weight:700 }
+.grid { display:grid; grid-template-columns: repeat(12, 1fr); gap:16px; padding:16px 40px }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; }
+.card h2 { font-size:13px; text-transform:uppercase; letter-spacing:0.08em; color:var(--dim); margin:0 0 12px; font-weight:600 }
+.stat { font-size:32px; font-weight:700; letter-spacing:-0.02em }
+.stat.add { color:var(--cool) } .stat.del { color:var(--hot) } .stat.net { color:var(--accent) }
+.stat-sub { color:var(--dim); font-size:12px; margin-top:4px }
+.span-3 { grid-column: span 3 } .span-4 { grid-column: span 4 } .span-6 { grid-column: span 6 } .span-12 { grid-column: span 12 }
+canvas { max-height:280px }
+table { width:100%; border-collapse:collapse; font-size:13px }
+td { padding:6px 8px; border-bottom:1px solid var(--line) }
+td:last-child { text-align:right; color:var(--accent); font-variant-numeric:tabular-nums }
+.heat { display:grid; grid-template-columns: 40px repeat(24, 1fr); gap:2px; font-size:10px; color:var(--dim) }
+.heat .cell { aspect-ratio:1; border-radius:2px; background:#1a2432 }
+.heat .lbl { display:flex; align-items:center; justify-content:flex-end; padding-right:4px }
+.heat .htop { text-align:center; padding-bottom:4px }
+.callout { display:flex; gap:16px; align-items:baseline }
+.callout .big { font-size:44px; font-weight:800; color:var(--accent); letter-spacing:-0.03em }
+.callout .txt { color:var(--dim); font-size:13px; white-space:pre-line }
+.pill { display:inline-block; padding:3px 10px; border-radius:999px; background:#1a2432; color:var(--accent); font-size:12px; margin-right:6px }
+footer { padding:20px 40px 40px; color:var(--dim); font-size:12px; text-align:center }
+.hint { color:var(--dim); font-size:11px; margin-top:8px }
+</style></head><body>
+<header><h1 id="hdr-title"></h1><div class="sub"><span id="hdr-scan"></span> - <span id="hdr-sub"></span></div></header>
+
+<div class="section-hd" style="padding-top:18px">Activity</div>
+<div class="grid">
+  <div class="card span-3"><h2>Total commits</h2><div class="stat" id="s-total"></div><div class="stat-sub" id="s-span"></div></div>
+  <div class="card span-3"><h2>Active days</h2><div class="stat" id="s-active"></div><div class="stat-sub" id="s-avg"></div></div>
+  <div class="card span-3"><h2>Repos touched</h2><div class="stat" id="s-repos"></div><div class="stat-sub">distinct git repositories</div></div>
+  <div class="card span-3"><h2>Merge commits</h2><div class="stat" id="s-merge"></div><div class="stat-sub">of total commits</div></div>
+
+  <div class="card span-6"><h2>Time of day</h2><canvas id="chart-hour"></canvas>
+    <div style="margin-top:10px;font-size:12px;color:var(--dim)">
+      <span class="pill" id="p-night"></span>night (0-7)
+      <span class="pill" id="p-morning"></span>morning (7-12)
+      <span class="pill" id="p-afternoon"></span>afternoon (12-18)
+      <span class="pill" id="p-evening"></span>evening (18-24)
+    </div></div>
+  <div class="card span-6"><h2>Day of week</h2><canvas id="chart-dow"></canvas>
+    <div style="margin-top:10px;font-size:12px;color:var(--dim)">Weekend share: <span id="p-weekend" class="pill"></span></div></div>
+
+  <div class="card span-12"><h2>Heatmap - hour x day of week</h2><div class="heat" id="heat"></div></div>
+  <div class="card span-12"><h2>Commits per month</h2><canvas id="chart-month" style="max-height:240px"></canvas></div>
+  <div class="card span-12"><h2>Last 365 days</h2><canvas id="chart-daily" style="max-height:200px"></canvas></div>
+
+  <div class="card span-4">
+    <h2>Biggest commit burst</h2><div class="callout"><div class="big" id="burst-n"></div><div class="txt" id="burst-t"></div></div>
+    <div style="margin-top:18px"></div><h2>Longest streak</h2><div class="callout"><div class="big" id="streak-n"></div><div class="txt" id="streak-t"></div></div>
+    <div style="margin-top:18px"></div><h2>Most commits in one day</h2><div class="callout"><div class="big" id="topday-n"></div><div class="txt" id="topday-t"></div></div>
+    <div style="margin-top:18px"></div><h2>Longest silence</h2><div class="callout"><div class="big" id="gap-n"></div><div class="txt" id="gap-t"></div></div>
+  </div>
+  <div class="card span-4"><h2>Top repositories (by commits)</h2><table id="t-repos"></table></div>
+  <div class="card span-4"><h2>Favorite commit verbs</h2><table id="t-verbs"></table></div>
+
+  <div class="card span-12"><h2>Commits per year</h2><canvas id="chart-year" style="max-height:180px"></canvas></div>
+</div>
+
+<div class="section-hd">Lines of code</div>
+<div class="grid">
+  <div class="card span-3"><h2>Lines added</h2><div class="stat add" id="l-add"></div><div class="stat-sub">filtered (no lockfiles, vendor, minified, binaries)</div></div>
+  <div class="card span-3"><h2>Lines removed</h2><div class="stat del" id="l-del"></div><div class="stat-sub" id="l-del-sub"></div></div>
+  <div class="card span-3"><h2>Net delta</h2><div class="stat net" id="l-net"></div><div class="stat-sub" id="l-net-sub"></div></div>
+  <div class="card span-3"><h2>Raw (all files)</h2><div class="stat" id="l-raw"></div><div class="stat-sub" id="l-raw-sub"></div></div>
+
+  <div class="card span-12"><h2>Lines added / removed per month</h2><canvas id="chart-locmonth" style="max-height:260px"></canvas></div>
+  <div class="card span-6"><h2>Code volume by hour</h2><canvas id="chart-lochour"></canvas>
+    <div class="hint">Lines added per hour-of-day.</div></div>
+  <div class="card span-6"><h2>Code volume by weekday</h2><canvas id="chart-locdow"></canvas></div>
+
+  <div class="card span-4"><h2>Biggest single commit</h2>
+    <div class="callout"><div class="big" id="big-n"></div><div class="txt" id="big-t"></div></div>
+    <div class="hint" id="big-subj"></div></div>
+  <div class="card span-4"><h2>Top repos by lines added</h2><table id="t-locrepo"></table></div>
+  <div class="card span-4"><h2>Languages (by lines added)</h2><table id="t-ext"></table></div>
+
+  <div class="card span-12"><h2>Lines added / removed per year</h2><canvas id="chart-locyear" style="max-height:200px"></canvas></div>
+</div>
+<footer>generated <span id="f-ts"></span> by gitdna</footer>
+
+<script>
+const D = __DATA__;
+const fmt = n => n.toLocaleString();
+const fmtSigned = n => (n>=0?"+":"") + n.toLocaleString();
+document.getElementById("hdr-title").textContent = D.title;
+document.getElementById("hdr-scan").textContent = D.repos_count + " repositories with activity";
+document.getElementById("hdr-sub").textContent = D.first.slice(0,10) + " -> " + D.last.slice(0,10);
+document.getElementById("f-ts").textContent = D.generated;
+document.getElementById("s-total").textContent = fmt(D.total);
+document.getElementById("s-span").textContent = D.span_days + " days span, " + D.avg_per_day + "/day avg";
+document.getElementById("s-active").textContent = fmt(D.active_days);
+document.getElementById("s-avg").textContent = D.avg_active + " commits per active day";
+document.getElementById("s-repos").textContent = D.repos_count;
+document.getElementById("s-merge").textContent = fmt(D.merges) + " (" + (100*D.merges/D.total).toFixed(1) + "%)";
+document.getElementById("p-night").textContent = D.night_pct + "%";
+document.getElementById("p-morning").textContent = D.morning_pct + "%";
+document.getElementById("p-afternoon").textContent = D.afternoon_pct + "%";
+document.getElementById("p-evening").textContent = D.evening_pct + "%";
+document.getElementById("p-weekend").textContent = D.weekend_pct + "%";
+document.getElementById("burst-n").textContent = D.burst.count;
+document.getElementById("burst-t").textContent = "commits in 60 minutes\nstarting " + D.burst.start.replace("T"," ").slice(0,16);
+document.getElementById("streak-n").textContent = D.streak.days + "d";
+document.getElementById("streak-t").textContent = D.streak.start + " -> " + D.streak.end;
+document.getElementById("topday-n").textContent = D.top_day.count;
+document.getElementById("topday-t").textContent = "on " + D.top_day.date;
+document.getElementById("gap-n").textContent = D.longest_gap.days + "d";
+document.getElementById("gap-t").textContent = D.longest_gap.from.slice(0,10) + " -> " + D.longest_gap.to.slice(0,10);
+
+const L = D.loc;
+document.getElementById("l-add").textContent = "+" + fmt(L.total_add);
+document.getElementById("l-del").textContent = "-" + fmt(L.total_del);
+document.getElementById("l-del-sub").textContent = L.total_del ? "ratio add/del: " + (L.total_add/L.total_del).toFixed(2) : "";
+document.getElementById("l-net").textContent = fmtSigned(L.net);
+document.getElementById("l-net-sub").textContent = L.commits_with_data ? "avg per commit: +" + Math.round(L.total_add/L.commits_with_data).toLocaleString() : "";
+document.getElementById("l-raw").textContent = "+" + fmt(L.total_add_raw);
+document.getElementById("l-raw-sub").textContent = "-" + fmt(L.total_del_raw) + " incl. locks/vendor/binaries";
+document.getElementById("big-n").textContent = L.biggest.add ? "+" + fmt(L.biggest.add) : "-";
+document.getElementById("big-t").textContent = L.biggest.repo + "\n" + L.biggest.when.replace("T"," ").slice(0,16) + "\n-" + fmt(L.biggest["del"]) + " lines removed\nsha " + L.biggest.sha;
+document.getElementById("big-subj").textContent = L.biggest.subject ? "\u201C" + L.biggest.subject + "\u201D" : "";
+
+{ const t = document.getElementById("t-repos"); D.top_repos.forEach(([n,c]) => { const tr=document.createElement("tr"); tr.innerHTML=`<td>${n}</td><td>${fmt(c)}</td>`; t.appendChild(tr); }); }
+{ const t = document.getElementById("t-verbs"); D.top_verbs.forEach(([n,c]) => { const tr=document.createElement("tr"); tr.innerHTML=`<td>${n}</td><td>${fmt(c)}</td>`; t.appendChild(tr); }); }
+{ const t = document.getElementById("t-locrepo"); L.top_repos_loc.forEach(([n,a,d]) => { const tr=document.createElement("tr"); tr.innerHTML=`<td>${n}</td><td>+${fmt(a)} / -${fmt(d)}</td>`; t.appendChild(tr); }); }
+{ const t = document.getElementById("t-ext"); L.top_ext.forEach(([n,a]) => { const tr=document.createElement("tr"); tr.innerHTML=`<td>.${n}</td><td>+${fmt(a)}</td>`; t.appendChild(tr); }); }
+
+Chart.defaults.color = "#8ea2bd";
+Chart.defaults.borderColor = "#1f2a39";
+const opt = extra => Object.assign({ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}},x:{grid:{display:false}}} }, extra||{});
+
+new Chart(document.getElementById("chart-hour"), { type:"bar", data:{ labels:[...Array(24).keys()].map(h=>h+"h"), datasets:[{ data:D.hours, backgroundColor:"#7cc4ff", borderRadius:4 }]}, options: opt() });
+new Chart(document.getElementById("chart-dow"), { type:"bar", data:{ labels:["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], datasets:[{ data:D.dows, backgroundColor:D.dows.map((_,i)=>i>=5?"#ff6b6b":"#5ae0a3"), borderRadius:4 }]}, options: opt() });
+new Chart(document.getElementById("chart-month"), { type:"line", data:{ labels:D.month_labels, datasets:[{ data:D.month_counts, borderColor:"#7cc4ff", backgroundColor:"rgba(124,196,255,0.15)", fill:true, tension:0.25, pointRadius:0 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}},x:{grid:{display:false},ticks:{maxTicksLimit:20}}} }});
+new Chart(document.getElementById("chart-daily"), { type:"bar", data:{ labels:D.daily_labels, datasets:[{ data:D.daily_counts, backgroundColor:"#5ae0a3" }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}},x:{grid:{display:false},ticks:{maxTicksLimit:12}}} }});
+new Chart(document.getElementById("chart-year"), { type:"bar", data:{ labels:D.years.map(y=>y[0]), datasets:[{ data:D.years.map(y=>y[1]), backgroundColor:"#ffb36b", borderRadius:4 }]}, options: opt() });
+
+new Chart(document.getElementById("chart-locmonth"), { type:"bar", data:{ labels:L.month_labels, datasets:[
+  { label:"added", data:L.month_add, backgroundColor:"#5ae0a3", stack:"s" },
+  { label:"removed", data:L.month_del, backgroundColor:"#ff6b6b", stack:"s" } ]},
+  options:{ plugins:{legend:{labels:{color:"#8ea2bd"}}}, scales:{y:{grid:{color:"#1f2a39"},stacked:true,ticks:{callback:v=>v.toLocaleString()}},x:{grid:{display:false},stacked:true,ticks:{maxTicksLimit:20}}} }});
+new Chart(document.getElementById("chart-lochour"), { type:"bar", data:{ labels:[...Array(24).keys()].map(h=>h+"h"), datasets:[{ data:L.by_hour, backgroundColor:"#5ae0a3", borderRadius:4 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"},ticks:{callback:v=>v.toLocaleString()}},x:{grid:{display:false}}} }});
+new Chart(document.getElementById("chart-locdow"), { type:"bar", data:{ labels:["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], datasets:[{ data:L.by_dow, backgroundColor:L.by_dow.map((_,i)=>i>=5?"#ff6b6b":"#5ae0a3"), borderRadius:4 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"},ticks:{callback:v=>v.toLocaleString()}},x:{grid:{display:false}}} }});
+new Chart(document.getElementById("chart-locyear"), { type:"bar", data:{ labels:L.by_year.map(y=>y[0]), datasets:[
+  { label:"added", data:L.by_year.map(y=>y[1]), backgroundColor:"#5ae0a3", stack:"s" },
+  { label:"removed", data:L.by_year.map(y=>-y[2]), backgroundColor:"#ff6b6b", stack:"s" } ]},
+  options:{ plugins:{legend:{labels:{color:"#8ea2bd"}}}, scales:{y:{grid:{color:"#1f2a39"},stacked:true,ticks:{callback:v=>v.toLocaleString()}},x:{grid:{display:false},stacked:true}} }});
+
+{
+  const container = document.getElementById("heat");
+  const days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+  container.appendChild(Object.assign(document.createElement("div"), {className:"lbl"}));
+  for (let h=0; h<24; h++) { const d=document.createElement("div"); d.className="htop"; d.textContent=h; container.appendChild(d); }
+  let mx = 0; for (const row of D.heat) for (const v of row) if (v>mx) mx = v;
+  for (let w=0; w<7; w++) {
+    const l=document.createElement("div"); l.className="lbl"; l.textContent=days[w]; container.appendChild(l);
+    for (let h=0; h<24; h++) {
+      const c=document.createElement("div"); c.className="cell";
+      const v=D.heat[w][h]; const a=mx?v/mx:0;
+      c.style.background=`rgba(124, 196, 255, ${0.08 + a*0.92})`;
+      c.title=`${days[w]} ${h}:00 - ${v} commits`;
+      container.appendChild(c);
+    }
+  }
+}
+</script></body></html>
+"""
+
+
+def render(data: dict) -> str:
+    payload = json.dumps(data)
+    return (HTML_TEMPLATE
+            .replace("__DATA__", payload)
+            .replace("__TITLE__", data["title"]))
+
+
+def default_author_pattern() -> str:
+    name = subprocess.run(["git", "config", "user.name"], capture_output=True, text=True).stdout.strip()
+    email = subprocess.run(["git", "config", "user.email"], capture_output=True, text=True).stdout.strip()
+    parts = []
+    if email:
+        parts.append(email.split("@", 1)[0])
+    if name:
+        for tok in re.split(r"\s+", name):
+            if len(tok) >= 3:
+                parts.append(tok)
+    seen, out = set(), []
+    for p in parts:
+        k = p.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(p)
+    return "\\|".join(out) if out else ""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Scan a directory of git repos and build a personal commit dashboard."
+    )
+    ap.add_argument("root", nargs="?", default=".", help="directory to scan for .git repositories (default: .)")
+    ap.add_argument("-a", "--author", default=None,
+                    help="git author pattern (escaped-alternation, e.g. 'alice\\|bob@co.com'). defaults to local git config user.")
+    ap.add_argument("-o", "--output", default=None,
+                    help="output HTML file (default: <root>/gitdna.html)")
+    ap.add_argument("-t", "--title", default=None, help="dashboard title (default: 'Git DNA - <pattern>')")
+    ap.add_argument("-d", "--max-depth", type=int, default=6, help="max directory depth to scan (default: 6)")
+    ap.add_argument("-j", "--jobs", type=int, default=min(16, (os.cpu_count() or 4) * 2),
+                    help="parallel workers (default: 2x CPU, capped at 16)")
+    ap.add_argument("--timeout", type=int, default=60, help="per-repo git timeout in seconds (default: 60)")
+    ap.add_argument("--open", action="store_true", help="open the output in the default browser when done")
+    ap.add_argument("--json", default=None, help="also write the raw analysis JSON to this path")
+    args = ap.parse_args()
+
+    if shutil.which("git") is None:
+        print("git not found in PATH", file=sys.stderr)
+        return 2
+
+    root = Path(args.root).resolve()
+    if not root.is_dir():
+        print(f"not a directory: {root}", file=sys.stderr)
+        return 2
+
+    pattern = args.author or default_author_pattern()
+    if not pattern:
+        print("could not infer author pattern; pass --author", file=sys.stderr)
+        return 2
+
+    output = Path(args.output) if args.output else root / "gitdna.html"
+    title = args.title or f"Git DNA - {pattern.replace(chr(92)+'|', ', ')}"
+
+    print(f"scanning {root} (max depth {args.max_depth})", file=sys.stderr)
+    repos = find_repos(root, args.max_depth)
+    print(f"found {len(repos)} git repositories", file=sys.stderr)
+    if not repos:
+        print("no repositories found", file=sys.stderr)
+        return 1
+
+    all_commits, all_loc = [], []
+    done = 0
+    with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        futs = {ex.submit(extract_repo, r, pattern, args.timeout): r for r in repos}
+        for fut in cf.as_completed(futs):
+            r = futs[fut]
+            try:
+                commits, loc_rows = fut.result()
+            except Exception as e:
+                print(f"  ! {r.name}: {e}", file=sys.stderr)
+                commits, loc_rows = [], []
+            all_commits.extend(commits)
+            all_loc.extend(loc_rows)
+            done += 1
+            if done % 10 == 0 or done == len(repos):
+                print(f"  [{done}/{len(repos)}] scanned", file=sys.stderr)
+
+    print(f"analyzing {len(all_commits)} commit rows, {len(all_loc)} file-changes", file=sys.stderr)
+    data = analyze(all_commits, all_loc, title)
+
+    if args.json:
+        Path(args.json).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        print(f"wrote {args.json}", file=sys.stderr)
+
+    output.write_text(render(data), encoding="utf-8")
+    print(f"wrote {output}", file=sys.stderr)
+    print(f"  {data['total']} commits across {data['repos_count']} repos",
+          file=sys.stderr)
+    print(f"  LOC +{data['loc']['total_add']:,} / -{data['loc']['total_del']:,} (filtered)",
+          file=sys.stderr)
+
+    if args.open:
+        try:
+            subprocess.Popen(["xdg-open", str(output)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
