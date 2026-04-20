@@ -60,7 +60,7 @@ def extract_repo(repo: Path, author_pattern: str, timeout: int) -> tuple[list[tu
     name = repo.name
     log = run_git(
         repo,
-        ["log", "--all", f"--author={author_pattern}",
+        ["log", "--all", "--extended-regexp", f"--author={author_pattern}",
          "--pretty=format:%H%x09%aI%x09%ae%x09%an%x09%s"],
         timeout,
     )
@@ -75,7 +75,7 @@ def extract_repo(repo: Path, author_pattern: str, timeout: int) -> tuple[list[tu
     # numstat in a second call (avoids parsing complexity, and skips merges)
     nums = run_git(
         repo,
-        ["log", "--all", "--no-merges", f"--author={author_pattern}",
+        ["log", "--all", "--no-merges", "--extended-regexp", f"--author={author_pattern}",
          "--pretty=format:C\t%H\t%aI", "--numstat"],
         timeout,
     )
