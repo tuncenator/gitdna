@@ -113,6 +113,65 @@ def extract_repo(repo: Path, author_pattern: str, timeout: int) -> tuple[list[tu
     return commits, loc_rows
 
 
+def author_needles(pattern: str) -> list[str]:
+    """Lowercase tokens to match against a blame line's author or email."""
+    parts = re.split(r"\\\||\|", pattern)
+    return [p.strip().lower() for p in parts if p.strip()]
+
+
+def blame_repo(repo: Path, needles: list[str], timeout: int) -> dict[int, int]:
+    """Count lines in HEAD authored by user, bucketed by their author-year."""
+    out = run_git(repo, ["ls-tree", "-r", "HEAD", "--name-only"], timeout)
+    if not out:
+        return {}
+    survived: collections.Counter = collections.Counter()
+    files = [f for f in out.splitlines() if f and not NOISE_RE.search(f)]
+    for f in files:
+        blame = run_git(repo, ["blame", "--porcelain", "HEAD", "--", f], timeout)
+        if not blame:
+            continue
+        meta: dict[str, list] = {}
+        counts: collections.Counter = collections.Counter()
+        cur_sha: str | None = None
+        for line in blame.splitlines():
+            if line.startswith("\t"):
+                if cur_sha:
+                    counts[cur_sha] += 1
+                continue
+            if not line:
+                continue
+            head = line.split(" ", 1)[0]
+            if len(head) == 40 and all(c in "0123456789abcdef" for c in head):
+                cur_sha = head
+                meta.setdefault(cur_sha, ["", "", 0])
+                continue
+            if cur_sha is None:
+                continue
+            key, _, val = line.partition(" ")
+            if key == "author":
+                meta[cur_sha][0] = val
+            elif key == "author-mail":
+                meta[cur_sha][1] = val.strip().lstrip("<").rstrip(">")
+            elif key == "author-time":
+                try:
+                    meta[cur_sha][2] = int(val)
+                except ValueError:
+                    meta[cur_sha][2] = 0
+        for sha, n in counts.items():
+            m = meta.get(sha)
+            if not m:
+                continue
+            author, email, t = m
+            blob = (author + " " + email).lower()
+            if not any(needle in blob for needle in needles):
+                continue
+            if not t:
+                continue
+            year = dt.datetime.fromtimestamp(t, dt.timezone.utc).year
+            survived[year] += n
+    return dict(survived)
+
+
 def ext_of(path: str) -> str:
     if " => " in path:
         path = path.split(" => ", 1)[1]
@@ -122,6 +181,29 @@ def ext_of(path: str) -> str:
         if 0 < len(e) <= 8 and e.isalnum():
             return e
     return "(none)"
+
+
+def _build_survival(loc_by_year: dict, survival: dict[int, int]) -> dict:
+    """Combine 'lines added per year' with 'lines from year still alive in HEAD'."""
+    if not survival:
+        return {"enabled": False, "years": [], "added": [], "alive": [], "pct": [],
+                "total_added": 0, "total_alive": 0, "overall_pct": 0}
+    years = sorted(set(loc_by_year.keys()) | set(survival.keys()))
+    added = [loc_by_year.get(y, [0, 0])[0] for y in years]
+    alive = [survival.get(y, 0) for y in years]
+    pct = [round(100 * a / d, 1) if d else 0 for a, d in zip(alive, added)]
+    total_added = sum(added)
+    total_alive = sum(alive)
+    return {
+        "enabled": True,
+        "years": years,
+        "added": added,
+        "alive": alive,
+        "pct": pct,
+        "total_added": total_added,
+        "total_alive": total_alive,
+        "overall_pct": round(100 * total_alive / total_added, 1) if total_added else 0,
+    }
 
 
 def percentile(xs: list, p: float) -> float:
@@ -175,7 +257,8 @@ def gini(values: list[float]) -> float:
     return (2 * cum) / (n * s) - (n + 1) / n
 
 
-def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
+def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
+            survival: dict[int, int] | None = None) -> dict:
     # dedupe commits by sha
     seen = set()
     uniq = []
@@ -826,6 +909,7 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
             "deepest_depth": deepest_depth,
             "ext_entropy": ext_entropy,
             "ext_distinct": ext_distinct,
+            "survival": _build_survival(loc_by_year, survival or {}),
         },
     }
 
@@ -1049,6 +1133,9 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=60, help="per-repo git timeout in seconds (default: 60)")
     ap.add_argument("--open", action="store_true", help="open the output in the default browser when done")
     ap.add_argument("--json", default=None, help="also write the raw analysis JSON to this path")
+    ap.add_argument("--blame", action="store_true",
+                    help="run git blame on every file in HEAD to compute code-survival "
+                         "per year. Slow on large trees.")
     args = ap.parse_args()
 
     if shutil.which("git") is None:
@@ -1092,8 +1179,28 @@ def main() -> int:
             if done % 10 == 0 or done == len(repos):
                 print(f"  [{done}/{len(repos)}] scanned", file=sys.stderr)
 
+    survival = {}
+    if args.blame:
+        needles = author_needles(pattern)
+        print(f"running blame across {len(repos)} repos (this can be slow)", file=sys.stderr)
+        done = 0
+        with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+            futs = {ex.submit(blame_repo, r, needles, args.timeout): r for r in repos}
+            for fut in cf.as_completed(futs):
+                r = futs[fut]
+                try:
+                    counts = fut.result()
+                except Exception as e:
+                    print(f"  ! blame {r.name}: {e}", file=sys.stderr)
+                    counts = {}
+                for y, n in counts.items():
+                    survival[y] = survival.get(y, 0) + n
+                done += 1
+                if done % 10 == 0 or done == len(repos):
+                    print(f"  [{done}/{len(repos)}] blamed", file=sys.stderr)
+
     print(f"analyzing {len(all_commits)} commit rows, {len(all_loc)} file-changes", file=sys.stderr)
-    data = analyze(all_commits, all_loc, title)
+    data = analyze(all_commits, all_loc, title, survival=survival)
 
     if args.json:
         Path(args.json).write_text(json.dumps(data, indent=2), encoding="utf-8")
