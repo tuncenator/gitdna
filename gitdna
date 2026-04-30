@@ -1069,6 +1069,19 @@ td:last-child { text-align:right; color:var(--accent); font-variant-numeric:tabu
 .pill { display:inline-block; padding:3px 10px; border-radius:999px; background:#1a2432; color:var(--accent); font-size:12px; margin-right:6px }
 footer { padding:20px 40px 40px; color:var(--dim); font-size:12px; text-align:center }
 .hint { color:var(--dim); font-size:11px; margin-top:8px }
+.traj { display:flex; flex-direction:column; gap:6px }
+.traj-row { display:flex; align-items:center; gap:14px }
+.traj-lbl { width:170px; color:var(--dim); font-size:12px; text-align:right; font-variant-numeric:tabular-nums }
+.traj-val { width:72px; color:var(--accent); font-size:12px; text-align:right; font-variant-numeric:tabular-nums }
+.traj-chart-wrap { flex:1; height:36px; position:relative }
+.cal { display:flex; flex-direction:column; gap:8px }
+.cal-row { display:flex; align-items:center; gap:8px }
+.cal-yr-lbl { width:42px; color:var(--dim); font-size:12px; text-align:right; font-variant-numeric:tabular-nums }
+.cal-grid { display:grid; grid-template-columns: repeat(53, 11px); grid-auto-rows:11px; gap:2px }
+.cal-cell { width:11px; height:11px; border-radius:2px; background:#1a2432 }
+.long-table tr td:first-child { white-space:normal; word-break:break-all }
+td.num { text-align:right; color:var(--accent); font-variant-numeric:tabular-nums }
+td.dim { color:var(--dim); font-size:12px }
 </style></head><body>
 <header><h1 id="hdr-title"></h1><div class="sub"><span id="hdr-scan"></span> - <span id="hdr-sub"></span></div></header>
 
@@ -1125,6 +1138,101 @@ footer { padding:20px 40px 40px; color:var(--dim); font-size:12px; text-align:ce
 
   <div class="card span-12"><h2>Lines added / removed per year</h2><canvas id="chart-locyear" style="max-height:200px"></canvas></div>
 </div>
+
+<div class="section-hd">Sessions and rhythm</div>
+<div class="grid">
+  <div class="card span-3"><h2>Total sessions</h2><div class="stat" id="ses-n"></div><div class="stat-sub" id="ses-sub"></div></div>
+  <div class="card span-3"><h2>Median session length</h2><div class="stat" id="ses-med"></div><div class="stat-sub" id="ses-medc"></div></div>
+  <div class="card span-3"><h2>Longest single session</h2><div class="stat" id="ses-long"></div><div class="stat-sub" id="ses-long-sub"></div></div>
+  <div class="card span-3"><h2>Burstiness</h2><div class="stat" id="burst-b"></div><div class="stat-sub">B in [-1, 1]; higher means more bursty</div></div>
+
+  <div class="card span-6"><h2>Session length distribution</h2><canvas id="chart-sesbuckets"></canvas>
+    <div class="hint">Buckets: under 30 min, 30-60 min, 1-2 h, 2-4 h, over 4 h.</div></div>
+  <div class="card span-6"><h2>Repo concurrency entropy (per month)</h2><canvas id="chart-entropy"></canvas>
+    <div class="hint">Shannon entropy of commit distribution across repos. 0 = single repo; higher = scattered.</div></div>
+
+  <div class="card span-6"><h2>First commit of day (hour distribution)</h2><canvas id="chart-firsthour"></canvas>
+    <div class="hint">When your workday actually starts.</div></div>
+  <div class="card span-6"><h2>Vacations / outages (gap of 7+ days)</h2><table id="t-vacations"></table></div>
+</div>
+
+<div class="section-hd">Trajectory (year by year)</div>
+<div class="grid">
+  <div class="card span-12">
+    <h2>How you've changed</h2>
+    <div class="traj" id="traj"></div>
+    <div class="hint">Each row is a sparkline across years. Numbers on the right are the most recent year.</div>
+  </div>
+</div>
+
+<div class="section-hd">Subjects</div>
+<div class="grid">
+  <div class="card span-3"><h2>Conventional commits</h2><div class="stat" id="conv-pct"></div><div class="stat-sub" id="conv-sub"></div></div>
+  <div class="card span-3"><h2>Oops / typo / hack</h2><div class="stat" id="oops-n"></div><div class="stat-sub" id="oops-sub"></div></div>
+  <div class="card span-3"><h2>Reverts and fixups</h2><div class="stat" id="fix-n"></div><div class="stat-sub" id="fix-sub"></div></div>
+  <div class="card span-3"><h2>PR merges</h2><div class="stat" id="pr-n"></div><div class="stat-sub" id="pr-sub"></div></div>
+
+  <div class="card span-12"><h2>Subject categories per year</h2><canvas id="chart-cats" style="max-height:320px"></canvas></div>
+  <div class="card span-6"><h2>Conventional-commits adoption</h2><canvas id="chart-conv"></canvas></div>
+  <div class="card span-6"><h2>Top co-authors</h2><table id="t-coauthors"></table>
+    <div class="hint" id="coauthor-hint"></div></div>
+</div>
+
+<div class="section-hd">Code patterns</div>
+<div class="grid">
+  <div class="card span-3"><h2>Median commit (lines added)</h2><div class="stat" id="size-med"></div><div class="stat-sub" id="size-pct-sub"></div></div>
+  <div class="card span-3"><h2>p95 commit</h2><div class="stat" id="size-p95"></div><div class="stat-sub">95% of commits add fewer lines</div></div>
+  <div class="card span-3"><h2>Polyglot index</h2><div class="stat" id="ext-ent"></div><div class="stat-sub" id="ext-sub"></div></div>
+  <div class="card span-3"><h2>Repo Gini</h2><div class="stat" id="gini-n"></div><div class="stat-sub">0 = even spread; 1 = one repo</div></div>
+
+  <div class="card span-6"><h2>Commit-size distribution (lines added)</h2><canvas id="chart-sizes"></canvas></div>
+  <div class="card span-6"><h2>Test ratio per month</h2><canvas id="chart-testratio"></canvas>
+    <div class="hint">Share of LOC added under test/spec paths.</div></div>
+
+  <div class="card span-6 long-table"><h2>Most-touched files (top 25)</h2><table id="t-files"></table></div>
+  <div class="card span-6"><h2>Docs and config volume per month</h2><canvas id="chart-docs"></canvas></div>
+
+  <div class="card span-12"><h2>Deepest path you've written into</h2>
+    <div class="hint" id="deepest-path-text"></div></div>
+</div>
+
+<div class="section-hd" id="hd-survival" style="display:none">Code survival</div>
+<div class="grid" id="grid-survival" style="display:none">
+  <div class="card span-3"><h2>Lines alive in HEAD</h2><div class="stat add" id="surv-alive"></div><div class="stat-sub" id="surv-alive-sub"></div></div>
+  <div class="card span-3"><h2>Overall survival</h2><div class="stat" id="surv-pct"></div><div class="stat-sub">of all lines you've ever added</div></div>
+  <div class="card span-6"><h2>Years on file</h2><div class="stat" id="surv-years"></div><div class="stat-sub">distinct author-years still alive in HEAD</div></div>
+  <div class="card span-12"><h2>Lines you wrote in year X, still in HEAD</h2><canvas id="chart-survival" style="max-height:280px"></canvas></div>
+</div>
+
+<div class="section-hd">Identity and timezone</div>
+<div class="grid">
+  <div class="card span-6"><h2>Identities used</h2><table id="t-identities"></table></div>
+  <div class="card span-6"><h2>Timezone (modal UTC offset per month)</h2><canvas id="chart-tz"></canvas>
+    <div class="hint" id="tz-hint"></div></div>
+</div>
+
+<div class="section-hd">Repo lifecycle</div>
+<div class="grid">
+  <div class="card span-12 long-table"><h2>Per-repo lifecycle (top 50 by span)</h2><table id="t-lifecycle"></table></div>
+  <div class="card span-12 long-table"><h2>Cold-repo resurrections (gap of 90+ days)</h2><table id="t-resur"></table></div>
+</div>
+
+<div class="section-hd">Headlines</div>
+<div class="grid">
+  <div class="card span-6"><h2>Worst week ever</h2>
+    <div class="callout"><div class="big" id="ww-n"></div><div class="txt" id="ww-t"></div></div>
+    <canvas id="chart-ww-hours" style="max-height:160px;margin-top:8px"></canvas></div>
+  <div class="card span-6"><h2>Peak month, decoded</h2>
+    <div class="callout"><div class="big" id="pm-n"></div><div class="txt" id="pm-t"></div></div>
+    <div class="hint" id="pm-extra"></div></div>
+</div>
+
+<div class="section-hd">Calendar</div>
+<div class="grid">
+  <div class="card span-12"><h2>Multi-year heatmap</h2><div class="cal" id="cal"></div>
+    <div class="hint">Each column is one ISO week, each row is one weekday (Mon top to Sun bottom). Cells get darker with more commits.</div></div>
+</div>
+
 <footer>generated <span id="f-ts"></span> by gitdna</footer>
 
 <script>
@@ -1210,6 +1318,222 @@ new Chart(document.getElementById("chart-locyear"), { type:"bar", data:{ labels:
     }
   }
 }
+
+// --- sessions ---
+{
+  const S = D.sessions;
+  document.getElementById("ses-n").textContent = fmt(S.count);
+  document.getElementById("ses-sub").textContent = "mean inter-commit gap " + D.mean_inter_min + " min";
+  document.getElementById("ses-med").textContent = S.median_min + " min";
+  document.getElementById("ses-medc").textContent = "commits/session: median " + S.median_commits + " / p95 " + S.p95_commits;
+  document.getElementById("ses-long").textContent = (S.longest.minutes/60).toFixed(1) + " h";
+  document.getElementById("ses-long-sub").textContent = S.longest.commits + " commits, started " + S.longest.start.replace("T"," ").slice(0,16);
+  document.getElementById("burst-b").textContent = D.burstiness.toFixed(2);
+  new Chart(document.getElementById("chart-sesbuckets"), { type:"bar", data:{ labels:["<30m","30-60m","1-2h","2-4h",">4h"], datasets:[{ data:S.buckets, backgroundColor:"#7cc4ff", borderRadius:4 }]}, options: opt() });
+}
+
+// --- repo concurrency entropy ---
+new Chart(document.getElementById("chart-entropy"), { type:"line", data:{ labels:D.repo_entropy.labels, datasets:[{ data:D.repo_entropy.values, borderColor:"#ffb36b", backgroundColor:"rgba(255,179,107,0.18)", fill:true, tension:0.25, pointRadius:0 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}}, x:{grid:{display:false}, ticks:{maxTicksLimit:18}}} }});
+
+// --- first-hour-of-day distribution ---
+new Chart(document.getElementById("chart-firsthour"), { type:"bar", data:{ labels:[...Array(24).keys()].map(h=>h+"h"), datasets:[{ data:D.first_hour_dist, backgroundColor:"#5ae0a3", borderRadius:4 }]}, options: opt() });
+
+// --- vacations ---
+{
+  const t = document.getElementById("t-vacations");
+  if (!D.vacations.length) {
+    const tr=document.createElement("tr"); tr.innerHTML='<td class="dim">No gaps of 7 or more days.</td>'; t.appendChild(tr);
+  } else D.vacations.forEach(([from,to,days]) => {
+    const tr=document.createElement("tr"); tr.innerHTML=`<td>${from} -> ${to}</td><td class="num">${days}d</td>`; t.appendChild(tr);
+  });
+}
+
+// --- trajectory sparklines ---
+{
+  const C = D.chronotype;
+  const ms = D.loc.median_size_per_year;
+  const sizeYears = ms.map(x=>x[0]);
+  const sizeVals = ms.map(x=>x[1]);
+  const rows = [
+    { label:"centroid commit hour",  years:C.years, data:C.centroid_hour,    fmt:v=>v.toFixed(1)+"h",  color:"#7cc4ff" },
+    { label:"first commit hour",     years:C.years, data:C.first_commit_hour,fmt:v=>v.toFixed(1)+"h",  color:"#7cc4ff" },
+    { label:"night share (0-7h)",    years:C.years, data:C.night_pct,        fmt:v=>v.toFixed(1)+"%",  color:"#b88dff" },
+    { label:"evening share (18-24h)",years:C.years, data:C.evening_pct,      fmt:v=>v.toFixed(1)+"%",  color:"#ffb36b" },
+    { label:"weekend share",         years:C.years, data:C.weekend_pct,      fmt:v=>v.toFixed(1)+"%",  color:"#ff6b6b" },
+    { label:"repo entropy (mean)",   years:C.years, data:C.repo_entropy,     fmt:v=>v.toFixed(2),      color:"#5ae0a3" },
+    { label:"median commit size",    years:sizeYears,data:sizeVals,          fmt:v=>fmt(v)+" ln",      color:"#5ae0a3" },
+  ];
+  const traj = document.getElementById("traj");
+  rows.forEach((r, i) => {
+    const row = document.createElement("div"); row.className="traj-row";
+    const lbl = document.createElement("div"); lbl.className="traj-lbl"; lbl.textContent = r.label;
+    const wrap = document.createElement("div"); wrap.className="traj-chart-wrap";
+    const cv = document.createElement("canvas"); cv.id = "traj-cv-" + i; wrap.appendChild(cv);
+    const val = document.createElement("div"); val.className="traj-val";
+    val.textContent = r.data.length ? r.fmt(r.data[r.data.length-1]) : "-";
+    row.appendChild(lbl); row.appendChild(wrap); row.appendChild(val); traj.appendChild(row);
+    new Chart(cv, { type:"line", data:{ labels:r.years, datasets:[{ data:r.data, borderColor:r.color, backgroundColor:r.color+"33", fill:true, tension:0.3, pointRadius:r.data.length<=12?2:0 }]}, options:{ responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{y:{display:false}, x:{display:false}} }});
+  });
+}
+
+// --- subjects ---
+{
+  const conv = D.conv_commits;
+  const lastConv = conv.pct.length ? conv.pct[conv.pct.length-1] : 0;
+  document.getElementById("conv-pct").textContent = lastConv + "%";
+  document.getElementById("conv-sub").textContent = "in " + (conv.years.length ? conv.years[conv.years.length-1] : "n/a");
+  document.getElementById("oops-n").textContent = fmt(D.oops_count);
+  document.getElementById("oops-sub").textContent = "subjects with oops/typo/hack/finally...";
+  document.getElementById("fix-n").textContent = fmt(D.revert_count + D.fixup_count);
+  document.getElementById("fix-sub").textContent = D.revert_count + " reverts, " + D.fixup_count + " fixups";
+  document.getElementById("pr-n").textContent = fmt(D.pr_total);
+  document.getElementById("pr-sub").textContent = D.pr_top_repos.length ? "top: " + D.pr_top_repos[0][0] + " (" + D.pr_top_repos[0][1] + ")" : "no PR-style merges";
+
+  const cats = D.subject_cat_year;
+  const palette = ["#5ae0a3","#ff6b6b","#7cc4ff","#ffb36b","#b88dff","#dde47a","#6ee0ff","#ff8db5","#9ad79a","#aaaaaa"];
+  const datasets = D.subject_categories.map((cat, i) => ({ label:cat, data:cats.series[cat], backgroundColor:palette[i%palette.length], stack:"s" }));
+  new Chart(document.getElementById("chart-cats"), { type:"bar", data:{ labels:cats.years, datasets }, options:{ plugins:{legend:{labels:{color:"#8ea2bd"}}}, scales:{y:{grid:{color:"#1f2a39"}, stacked:true}, x:{grid:{display:false}, stacked:true}} }});
+
+  new Chart(document.getElementById("chart-conv"), { type:"line", data:{ labels:conv.years, datasets:[{ data:conv.pct, borderColor:"#7cc4ff", backgroundColor:"rgba(124,196,255,0.18)", fill:true, tension:0.25, pointRadius:3 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}, suggestedMax:100, ticks:{callback:v=>v+"%"}}, x:{grid:{display:false}}} }});
+
+  const tco = document.getElementById("t-coauthors");
+  if (!D.top_coauthors.length) {
+    const tr=document.createElement("tr"); tr.innerHTML='<td class="dim">No co-authored-by trailers.</td>'; tco.appendChild(tr);
+  } else D.top_coauthors.forEach(([name,n]) => {
+    const tr=document.createElement("tr"); tr.innerHTML=`<td>${name}</td><td class="num">${fmt(n)}</td>`; tco.appendChild(tr);
+  });
+  document.getElementById("coauthor-hint").textContent = D.coauthor_total ? D.coauthor_total + " mentions across " + D.coauthor_distinct + " co-authors." : "";
+}
+
+// --- code patterns ---
+{
+  const L = D.loc;
+  document.getElementById("size-med").textContent = fmt(L.size_p50);
+  document.getElementById("size-pct-sub").textContent = "p99: " + fmt(L.size_p99) + " lines";
+  document.getElementById("size-p95").textContent = fmt(L.size_p95);
+  document.getElementById("ext-ent").textContent = L.ext_entropy.toFixed(2);
+  document.getElementById("ext-sub").textContent = L.ext_distinct + " distinct extensions";
+  document.getElementById("gini-n").textContent = D.repo_gini.toFixed(2);
+
+  new Chart(document.getElementById("chart-sizes"), { type:"bar", data:{ labels:["0","1-10","11-100","101-500","501-2k","2k+"], datasets:[{ data:L.size_buckets, backgroundColor:"#7cc4ff", borderRadius:4 }]}, options: opt() });
+
+  new Chart(document.getElementById("chart-testratio"), { type:"line", data:{ labels:L.test_ratio.labels, datasets:[{ data:L.test_ratio.values, borderColor:"#5ae0a3", backgroundColor:"rgba(90,224,163,0.18)", fill:true, tension:0.25, pointRadius:0 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}, ticks:{callback:v=>v+"%"}}, x:{grid:{display:false}, ticks:{maxTicksLimit:18}}} }});
+
+  new Chart(document.getElementById("chart-docs"), { type:"line", data:{ labels:L.docs_month.labels, datasets:[
+    { label:"docs", data:L.docs_month.docs, borderColor:"#7cc4ff", backgroundColor:"rgba(124,196,255,0.15)", fill:true, tension:0.25, pointRadius:0 },
+    { label:"config", data:L.docs_month.config, borderColor:"#ffb36b", backgroundColor:"rgba(255,179,107,0.15)", fill:true, tension:0.25, pointRadius:0 }
+  ]}, options:{ plugins:{legend:{labels:{color:"#8ea2bd"}}}, scales:{y:{grid:{color:"#1f2a39"}, ticks:{callback:v=>v.toLocaleString()}}, x:{grid:{display:false}, ticks:{maxTicksLimit:18}}} }});
+
+  const tf = document.getElementById("t-files");
+  L.top_files.forEach(f => {
+    const tr=document.createElement("tr"); tr.innerHTML=`<td>${f.repo} / ${f.path}</td><td class="num">${f.touches}x / +${fmt(f.add)}</td>`; tf.appendChild(tr);
+  });
+  document.getElementById("deepest-path-text").textContent = L.deepest_path ? "depth " + L.deepest_depth + ": " + L.deepest_path : "all paths shallow";
+}
+
+// --- code survival (only if --blame produced data) ---
+if (D.loc.survival && D.loc.survival.enabled) {
+  const S = D.loc.survival;
+  document.getElementById("hd-survival").style.display = "";
+  document.getElementById("grid-survival").style.display = "";
+  document.getElementById("surv-alive").textContent = "+" + fmt(S.total_alive);
+  document.getElementById("surv-alive-sub").textContent = "of +" + fmt(S.total_added) + " ever added";
+  document.getElementById("surv-pct").textContent = S.overall_pct + "%";
+  document.getElementById("surv-years").textContent = S.years.filter((y,i)=>S.alive[i]>0).length;
+  new Chart(document.getElementById("chart-survival"), { type:"bar", data:{ labels:S.years, datasets:[
+    { label:"added that year", data:S.added, backgroundColor:"rgba(124,196,255,0.45)" },
+    { label:"alive in HEAD",   data:S.alive, backgroundColor:"#5ae0a3" }
+  ]}, options:{ plugins:{legend:{labels:{color:"#8ea2bd"}}}, scales:{y:{grid:{color:"#1f2a39"}, ticks:{callback:v=>v.toLocaleString()}}, x:{grid:{display:false}}} }});
+}
+
+// --- identities ---
+{
+  const t = document.getElementById("t-identities");
+  D.identities.forEach(([name, email, fs, ls, ct]) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${name}<br><span class="dim">${email}</span></td><td class="num">${fs.slice(0,10)} -> ${ls.slice(0,10)}<br><span class="dim">${fmt(ct)} commits</span></td>`;
+    t.appendChild(tr);
+  });
+}
+
+// --- timezone ---
+{
+  const tz = D.timezone;
+  new Chart(document.getElementById("chart-tz"), { type:"line", data:{ labels:tz.labels, datasets:[{ data:tz.modal, borderColor:"#ffb36b", backgroundColor:"rgba(255,179,107,0.15)", fill:false, stepped:true, pointRadius:0 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}, ticks:{callback:v=>(v>=0?"+":"")+v+"h"}}, x:{grid:{display:false}, ticks:{maxTicksLimit:18}}} }});
+  document.getElementById("tz-hint").textContent = tz.distinct.length > 1
+    ? tz.distinct.length + " distinct offsets, " + tz.transitions.length + " transitions"
+    : "single offset throughout";
+}
+
+// --- repo lifecycle ---
+{
+  const t = document.getElementById("t-lifecycle");
+  D.repo_lifecycle.forEach(r => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${r.repo}</td><td class="num">${r.first.slice(0,10)} -> ${r.last.slice(0,10)}<br><span class="dim">${r.span_days}d, ${fmt(r.commits)} commits, peak ${r.peak} (${r.peak_count})</span></td>`;
+    t.appendChild(tr);
+  });
+}
+
+// --- resurrections ---
+{
+  const t = document.getElementById("t-resur");
+  if (!D.resurrections.length) {
+    const tr=document.createElement("tr"); tr.innerHTML='<td class="dim">No resurrections.</td>'; t.appendChild(tr);
+  } else D.resurrections.forEach(r => {
+    const tr=document.createElement("tr"); tr.innerHTML=`<td>${r.repo}</td><td class="num">${r.from} -> ${r.to}<br><span class="dim">${r.days}d gap</span></td>`; t.appendChild(tr);
+  });
+}
+
+// --- worst week ---
+{
+  const W = D.worst_week;
+  document.getElementById("ww-n").textContent = W.commits;
+  document.getElementById("ww-t").textContent = "commits in 7 days\n" + W.start + " -> " + W.end + "\n" + (W.top_repos[0] ? "mostly in " + W.top_repos[0][0] : "");
+  new Chart(document.getElementById("chart-ww-hours"), { type:"bar", data:{ labels:[...Array(24).keys()].map(h=>h+"h"), datasets:[{ data:W.hours, backgroundColor:"#ff6b6b", borderRadius:3 }]}, options: opt() });
+}
+
+// --- peak month ---
+{
+  const P = D.peak_month;
+  document.getElementById("pm-n").textContent = P.commits;
+  document.getElementById("pm-t").textContent = "commits in " + P.label + "\nmostly " + P.top_repo + "\nmedian commit: +" + fmt(P.median_commit_size||0) + " lines";
+  document.getElementById("pm-extra").textContent = "dominant category: " + P.top_category + " (" + P.top_category_count + ")" + (P.top_language ? "; top language: ." + P.top_language : "");
+}
+
+// --- multi-year calendar ---
+(function(){
+  const cal = document.getElementById("cal");
+  const dates = Object.keys(D.all_daily).sort();
+  if (!dates.length) return;
+  const fy = parseInt(dates[0].slice(0,4));
+  const ly = parseInt(dates[dates.length-1].slice(0,4));
+  let mx = 0; for (const v of Object.values(D.all_daily)) if (v>mx) mx = v;
+  for (let y = fy; y <= ly; y++) {
+    const row = document.createElement("div"); row.className="cal-row";
+    const lbl = document.createElement("div"); lbl.className="cal-yr-lbl"; lbl.textContent = y;
+    const grid = document.createElement("div"); grid.className="cal-grid";
+    const yearStart = new Date(y, 0, 1);
+    const yearEnd = new Date(y+1, 0, 1);
+    const startWd = (yearStart.getDay()+6)%7; // Mon=0..Sun=6
+    for (let ts = yearStart.getTime(); ts < yearEnd.getTime(); ts += 86400000) {
+      const dd = new Date(ts);
+      const wd = (dd.getDay()+6)%7;
+      const dayOfYear = Math.round((ts - yearStart.getTime()) / 86400000);
+      const col = Math.floor((dayOfYear + startWd) / 7);
+      const iso = dd.getFullYear() + "-" + String(dd.getMonth()+1).padStart(2,"0") + "-" + String(dd.getDate()).padStart(2,"0");
+      const v = D.all_daily[iso] || 0;
+      const cell = document.createElement("div"); cell.className="cal-cell";
+      const a = mx ? v/mx : 0;
+      cell.style.background = v ? `rgba(124, 196, 255, ${0.10 + a*0.90})` : "#1a2432";
+      cell.style.gridColumn = (col+1);
+      cell.style.gridRow = (wd+1);
+      cell.title = `${iso}: ${v} commits`;
+      grid.appendChild(cell);
+    }
+    row.appendChild(lbl); row.appendChild(grid); cal.appendChild(row);
+  }
+})();
 </script></body></html>
 """
 
