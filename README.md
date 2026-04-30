@@ -3,7 +3,7 @@
 Point it at a directory of git repos, get back a single self-contained HTML
 dashboard of _your_ commit history across all of them.
 
-- **When you code** — hour-of-day, day-of-week, and a 24×7 heatmap
+- **When you code** — hour-of-day, day-of-week, and a 24x7 heatmap
 - **Momentum** — longest streak, biggest 1-hour burst, longest silence, most
   prolific single day
 - **Timeline** — commits per month, last-365-days bars, per-year totals
@@ -11,6 +11,28 @@ dashboard of _your_ commit history across all of them.
   includes lockfiles and vendor dirs
 - **LOC by month / hour / weekday / year** stacked bars
 - **Top repos, top languages, biggest single commit, favorite commit verbs**
+- **Sessions and rhythm** — coding-session model (60-min gap), median /
+  p95 length, longest single session, burstiness coefficient, vacations
+  (gaps of 7+ days), repo-concurrency entropy per month, day-start hour
+  distribution
+- **Trajectory** — per-year sparklines for centroid commit hour, first
+  commit hour, night / evening / weekend share, repo entropy, median
+  commit size
+- **Subjects** — feat / fix / refactor / docs / chore / test / style /
+  revert / merge classifier per year, conventional-commits adoption rate,
+  oops / fixup / revert / PR-merge counters, top co-authors
+- **Code patterns** — commit-size distribution and p50/p95/p99,
+  test-to-code ratio per month, docs and config volume, top 25 most
+  touched files, deepest path, polyglot index, repo Gini
+- **Identity and timezone** — every (name, email) tuple with first/last
+  seen, modal UTC offset per month and transitions
+- **Repo lifecycle** — per-repo first / last / span / peak month and a
+  cold-repo resurrection log (gaps of 90+ days)
+- **Headlines** — worst week ever (with hourly profile) and peak month
+  decoded (top repo, category, language, median commit size)
+- **Multi-year calendar heatmap**
+- **Code survival** — opt-in `--blame` pass: % of lines from each year
+  still alive in HEAD
 
 No Python dependencies. Charts are rendered client-side by
 [Chart.js](https://www.chartjs.org/) loaded from jsDelivr.
@@ -55,8 +77,9 @@ a pattern from your local `git config user.name` and `user.email`.
 | `-d`, `--max-depth` | `6` | how deep to walk for nested repos |
 | `-j`, `--jobs` | `min(16, 2×CPU)` | parallel workers |
 | `--timeout` | `60` | per-repo git timeout, seconds |
-| `--json PATH` | — | also dump the raw analysis JSON |
+| `--json PATH` | - | also dump the raw analysis JSON |
 | `--open` | off | open the output in the default browser |
+| `--blame` | off | run `git blame` on every file in HEAD to compute the per-year code-survival stat. Slow on large trees. |
 
 ## How it works
 
