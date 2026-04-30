@@ -396,6 +396,99 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
     # --- repo Gini ---
     repo_gini_val = round(gini(list(repos.values())), 3)
 
+    # --- subject classifier: bin each commit subject into one category ---
+    SUBJECT_BINS = [
+        ("feat",     re.compile(r"^(feat|add|new|introduc|implement|create|support)", re.I)),
+        ("fix",      re.compile(r"^(fix|bug|patch|hotfix|repair|resolve|correct)", re.I)),
+        ("refactor", re.compile(r"^(refactor|clean|cleanup|rename|move|reorganiz|simplif|tidy|extract|inline)", re.I)),
+        ("docs",     re.compile(r"^(doc|docs|readme|comment)", re.I)),
+        ("chore",    re.compile(r"^(chore|bump|deps|dep|update|upgrade|build|ci|release|version)", re.I)),
+        ("test",     re.compile(r"^(test|tests|spec|cover)", re.I)),
+        ("style",    re.compile(r"^(style|format|lint|prettier|fmt)", re.I)),
+        ("revert",   re.compile(r"^(revert|undo|rollback)", re.I)),
+        ("merge",    re.compile(r"^merge", re.I)),
+    ]
+    CONV_RE = re.compile(r"^(feat|fix|chore|refactor|docs|style|test|perf|build|ci|revert)(\([^)]*\))?!?:\s", re.I)
+    OOPS_RE = re.compile(r"\b(oops|wtf|ugh|argh|finally|whoops|smh|typo|hack|kludge|sigh)\b", re.I)
+    FIXUP_RE = re.compile(r"^(fixup!|squash!|amend!)", re.I)
+    PR_MERGE_RE = re.compile(r"^Merge\s+(pull\s+request|PR)\s+#(\d+)", re.I)
+
+    cat_counts = collections.Counter()
+    cat_per_year = collections.defaultdict(lambda: collections.Counter())
+    conv_per_year = collections.defaultdict(lambda: [0, 0])  # [conv, total]
+    oops_count = 0
+    fixup_count = 0
+    revert_count = 0
+    pr_count_by_repo = collections.Counter()
+    pr_total = 0
+    subj_lengths = []
+    for c in commits:
+        subj = c[6].strip()
+        if not subj:
+            continue
+        subj_lengths.append(len(subj))
+        cat = "other"
+        for label, rx in SUBJECT_BINS:
+            if rx.search(subj):
+                cat = label
+                break
+        cat_counts[cat] += 1
+        cat_per_year[c[2].year][cat] += 1
+        conv_per_year[c[2].year][1] += 1
+        if CONV_RE.search(subj):
+            conv_per_year[c[2].year][0] += 1
+        if OOPS_RE.search(subj):
+            oops_count += 1
+        if FIXUP_RE.search(subj):
+            fixup_count += 1
+        if cat == "revert":
+            revert_count += 1
+        m = PR_MERGE_RE.search(subj)
+        if m:
+            pr_count_by_repo[c[0]] += 1
+            pr_total += 1
+
+    cat_year_keys = sorted(cat_per_year.keys())
+    cat_categories = [b[0] for b in SUBJECT_BINS] + ["other"]
+    cat_year_series = {
+        cat: [cat_per_year[y].get(cat, 0) for y in cat_year_keys]
+        for cat in cat_categories
+    }
+    conv_years = sorted(conv_per_year.keys())
+    conv_pct = [
+        round(100 * conv_per_year[y][0] / conv_per_year[y][1], 1) if conv_per_year[y][1] else 0
+        for y in conv_years
+    ]
+
+    # --- co-authors ---
+    coauthor_counter = collections.Counter()
+    coauthor_total = 0
+    for c in commits:
+        if not c[7]:
+            continue
+        for raw in c[7].split("\x1f"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            coauthor_counter[raw] += 1
+            coauthor_total += 1
+    top_coauthors = coauthor_counter.most_common(15)
+
+    # --- identity timeline: distinct (name, email) with first/last/count ---
+    identities = {}
+    for c in commits:
+        key = (c[4], c[3])  # (name, email)
+        first_seen, last_seen, count = identities.get(key, (c[2], c[2], 0))
+        if c[2] < first_seen:
+            first_seen = c[2]
+        if c[2] > last_seen:
+            last_seen = c[2]
+        identities[key] = (first_seen, last_seen, count + 1)
+    identity_rows = sorted(
+        [(n, e, fs.isoformat(), ls.isoformat(), ct) for (n, e), (fs, ls, ct) in identities.items()],
+        key=lambda r: r[2],
+    )
+
     # LOC
     commit_add_raw = collections.defaultdict(int)
     commit_del_raw = collections.defaultdict(int)
@@ -534,6 +627,24 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
         "repo_entropy": {"labels": entropy_labels, "values": entropy_values},
         "vacations": top_vacations,
         "repo_gini": repo_gini_val,
+        "subject_categories": cat_categories,
+        "subject_cat_counts": [(c, cat_counts.get(c, 0)) for c in cat_categories],
+        "subject_cat_year": {"years": cat_year_keys, "series": cat_year_series},
+        "subject_len": {
+            "median": int(statistics.median(subj_lengths)) if subj_lengths else 0,
+            "p95": int(percentile(subj_lengths, 95)),
+            "max": max(subj_lengths) if subj_lengths else 0,
+        },
+        "conv_commits": {"years": conv_years, "pct": conv_pct},
+        "oops_count": oops_count,
+        "fixup_count": fixup_count,
+        "revert_count": revert_count,
+        "pr_total": pr_total,
+        "pr_top_repos": pr_count_by_repo.most_common(10),
+        "coauthor_total": coauthor_total,
+        "coauthor_distinct": len(coauthor_counter),
+        "top_coauthors": top_coauthors,
+        "identities": identity_rows,
         "loc": {
             "commits_with_data": len(commit_add_raw),
             "total_add_raw": total_add_raw,
