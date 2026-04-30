@@ -490,6 +490,10 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
     )
 
     # LOC
+    TEST_RE = re.compile(r"(^|/)(tests?|spec|specs|__tests__|e2e)/|(_test|_spec|\.test|\.spec)\.[a-z0-9]+$", re.I)
+    DOCS_RE = re.compile(r"\.(md|mdx|rst|txt|adoc|asciidoc)$", re.I)
+    CONFIG_RE = re.compile(r"\.(ya?ml|toml|ini|cfg|conf|json|xml|properties|env)$", re.I)
+
     commit_add_raw = collections.defaultdict(int)
     commit_del_raw = collections.defaultdict(int)
     commit_add = collections.defaultdict(int)
@@ -498,6 +502,13 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
     ext_add = collections.Counter()
     repo_add = collections.Counter()
     repo_del = collections.Counter()
+    file_touches = collections.Counter()
+    file_add = collections.Counter()
+    test_by_month = collections.defaultdict(lambda: [0, 0])  # [test_lines, code_lines]
+    docs_by_month = collections.defaultdict(int)
+    config_by_month = collections.defaultdict(int)
+    deepest_path = ""
+    deepest_depth = -1
 
     for repo, sha, iso, add, dele, path in loc_rows:
         commit_add_raw[sha] += add
@@ -515,6 +526,25 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
         ext_add[ext] += add
         repo_add[repo] += add
         repo_del[repo] += dele
+        # path-aware bins
+        clean_path = path.split(" => ", 1)[1] if " => " in path else path
+        depth = clean_path.count("/")
+        if depth > deepest_depth:
+            deepest_depth = depth
+            deepest_path = f"{repo}/{clean_path}"
+        file_touches[(repo, clean_path)] += 1
+        file_add[(repo, clean_path)] += add
+        meta = commit_meta.get(sha)
+        if meta:
+            ymo = (meta[2].year, meta[2].month)
+            if TEST_RE.search(clean_path):
+                test_by_month[ymo][0] += add
+            else:
+                test_by_month[ymo][1] += add
+            if DOCS_RE.search(clean_path):
+                docs_by_month[ymo] += add
+            if CONFIG_RE.search(clean_path):
+                config_by_month[ymo] += add
 
     total_add_raw = sum(commit_add_raw.values())
     total_del_raw = sum(commit_del_raw.values())
@@ -568,6 +598,62 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
     top_repos_loc_pairs = sorted(repo_add.items(), key=lambda x: x[1], reverse=True)[:15]
     top_repos_loc = [(r, a, repo_del.get(r, 0)) for r, a in top_repos_loc_pairs]
     year_loc_items = sorted(loc_by_year.items())
+
+    # commit-size distribution (additions only, post-noise filter)
+    commit_sizes = list(commit_add.values())
+    size_buckets = [0, 0, 0, 0, 0, 0]  # 0, 1-10, 11-100, 101-500, 501-2000, 2000+
+    for s in commit_sizes:
+        if s == 0:
+            size_buckets[0] += 1
+        elif s <= 10:
+            size_buckets[1] += 1
+        elif s <= 100:
+            size_buckets[2] += 1
+        elif s <= 500:
+            size_buckets[3] += 1
+        elif s <= 2000:
+            size_buckets[4] += 1
+        else:
+            size_buckets[5] += 1
+    size_p50 = int(percentile(commit_sizes, 50))
+    size_p95 = int(percentile(commit_sizes, 95))
+    size_p99 = int(percentile(commit_sizes, 99))
+
+    # median commit size by year
+    sizes_per_year = collections.defaultdict(list)
+    for sha, add in commit_add.items():
+        meta = commit_meta.get(sha)
+        if meta:
+            sizes_per_year[meta[2].year].append(add)
+    median_size_per_year = {y: int(statistics.median(v)) for y, v in sizes_per_year.items() if v}
+
+    # test ratio per month
+    test_ratio_labels = sorted(test_by_month.keys())
+    test_ratio_values = [
+        round(100 * test_by_month[k][0] / (test_by_month[k][0] + test_by_month[k][1]), 1)
+        if (test_by_month[k][0] + test_by_month[k][1]) else 0
+        for k in test_ratio_labels
+    ]
+    test_ratio_label_strs = [f"{y}-{m:02d}" for y, m in test_ratio_labels]
+
+    # docs effort per month aligned to existing month axis
+    docs_month_series = [docs_by_month.get((y, m), 0) for y, m in mkeys]
+    config_month_series = [config_by_month.get((y, m), 0) for y, m in mkeys]
+    docs_month_labels = [f"{y}-{m:02d}" for y, m in mkeys]
+
+    # most-touched files (top 25)
+    top_files = file_touches.most_common(25)
+    top_files_rich = [
+        {"repo": r, "path": p, "touches": t, "add": file_add.get((r, p), 0)}
+        for (r, p), t in top_files
+    ]
+
+    # extension polyglot entropy (Shannon over commit-counts per ext, not LOC)
+    ext_commit_counts = collections.Counter()
+    for (_r, p), n in file_touches.items():
+        ext_commit_counts[ext_of(p)] += n
+    ext_entropy = round(shannon_entropy(ext_commit_counts), 3)
+    ext_distinct = len([e for e, n in ext_commit_counts.items() if n > 0])
 
     return {
         "title": title,
@@ -661,6 +747,18 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
             "top_ext": top_ext,
             "top_repos_loc": top_repos_loc,
             "by_year": [(y, v[0], v[1]) for y, v in year_loc_items],
+            "size_buckets": size_buckets,
+            "size_p50": size_p50,
+            "size_p95": size_p95,
+            "size_p99": size_p99,
+            "median_size_per_year": sorted(median_size_per_year.items()),
+            "test_ratio": {"labels": test_ratio_label_strs, "values": test_ratio_values},
+            "docs_month": {"labels": docs_month_labels, "docs": docs_month_series, "config": config_month_series},
+            "top_files": top_files_rich,
+            "deepest_path": deepest_path,
+            "deepest_depth": deepest_depth,
+            "ext_entropy": ext_entropy,
+            "ext_distinct": ext_distinct,
         },
     }
 
