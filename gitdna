@@ -1219,10 +1219,11 @@ td.dim { color:var(--dim); font-size:12px }
 
 <div class="section-hd">Headlines</div>
 <div class="grid">
-  <div class="card span-6"><h2>Worst week ever</h2>
+  <div class="card span-6"><h2>Most intense week</h2>
     <div class="callout"><div class="big" id="ww-n"></div><div class="txt" id="ww-t"></div></div>
-    <canvas id="chart-ww-hours" style="max-height:160px;margin-top:8px"></canvas></div>
-  <div class="card span-6"><h2>Peak month, decoded</h2>
+    <canvas id="chart-ww-hours" style="max-height:160px;margin-top:8px"></canvas>
+    <div class="hint">When during the day those commits landed. A spike at one hour usually means scripted work; a spread means real interactive sessions.</div></div>
+  <div class="card span-6"><h2>Peak month, broken down</h2>
     <div class="callout"><div class="big" id="pm-n"></div><div class="txt" id="pm-t"></div></div>
     <div class="hint" id="pm-extra"></div></div>
 </div>
@@ -1485,20 +1486,46 @@ if (D.loc.survival && D.loc.survival.enabled) {
   });
 }
 
-// --- worst week ---
+// --- most intense week ---
 {
   const W = D.worst_week;
+  const weeklyAvg = D.span_days ? D.total / (D.span_days/7) : 0;
+  const ratio = weeklyAvg ? (W.commits/weeklyAvg).toFixed(1) : "-";
+  const repoLine = W.top_repos[0]
+    ? "mostly in " + W.top_repos[0][0] + " (" + Math.round(100*W.top_repos[0][1]/W.commits) + "% of the commits)"
+    : "";
   document.getElementById("ww-n").textContent = W.commits;
-  document.getElementById("ww-t").textContent = "commits in 7 days\n" + W.start + " -> " + W.end + "\n" + (W.top_repos[0] ? "mostly in " + W.top_repos[0][0] : "");
+  document.getElementById("ww-t").textContent =
+    "commits in 7 days, " + ratio + "x your weekly average of " + Math.round(weeklyAvg) +
+    "\n" + W.start + " -> " + W.end +
+    "\n" + repoLine;
   new Chart(document.getElementById("chart-ww-hours"), { type:"bar", data:{ labels:[...Array(24).keys()].map(h=>h+"h"), datasets:[{ data:W.hours, backgroundColor:"#ff6b6b", borderRadius:3 }]}, options: opt() });
 }
 
-// --- peak month ---
+// --- peak month broken down ---
 {
   const P = D.peak_month;
+  const monthlyAvg = D.span_days ? D.total / (D.span_days/30.4) : 0;
+  const ratio = monthlyAvg ? (P.commits/monthlyAvg).toFixed(1) : "-";
+  const repoPct = P.commits ? Math.round(100 * (P.top_repo_count||0) / P.commits) : 0;
+  const catPct  = P.commits ? Math.round(100 * (P.top_category_count||0) / P.commits) : 0;
+  const overallMed = D.loc && D.loc.size_p50 ? D.loc.size_p50 : 0;
+  const sizeNote = overallMed
+    ? " (your overall median is +" + fmt(overallMed) + ")"
+    : "";
   document.getElementById("pm-n").textContent = P.commits;
-  document.getElementById("pm-t").textContent = "commits in " + P.label + "\nmostly " + P.top_repo + "\nmedian commit: +" + fmt(P.median_commit_size||0) + " lines";
-  document.getElementById("pm-extra").textContent = "dominant category: " + P.top_category + " (" + P.top_category_count + ")" + (P.top_language ? "; top language: ." + P.top_language : "");
+  document.getElementById("pm-t").textContent =
+    "commits in " + P.label + ", " + ratio + "x your monthly average of " + Math.round(monthlyAvg) +
+    "\nmostly " + (P.top_repo || "n/a") + " (" + repoPct + "% of the commits)" +
+    "\nmedian commit: +" + fmt(P.median_commit_size||0) + " lines" + sizeNote;
+  const catLabel = P.top_category === "other"
+    ? "no conventional prefix (feat/fix/refactor/etc.)"
+    : "'" + P.top_category + "' subjects";
+  const langPart = P.top_language
+    ? "; most lines added were in ." + P.top_language + " files (" + fmt(P.top_language_lines||0) + " lines)"
+    : "";
+  document.getElementById("pm-extra").textContent =
+    "Dominant subject style: " + catLabel + " (" + catPct + "% of the month)" + langPart;
 }
 
 // --- multi-year calendar ---
