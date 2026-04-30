@@ -575,7 +575,7 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
                     peak_cats[cat] += 1
         peak_top_repo = peak_repos.most_common(1)[0] if peak_repos else ("", 0)
         peak_top_cat = peak_cats.most_common(1)[0] if peak_cats else ("", 0)
-        # peak month median commit size (using LOC, computed below — defer the lookup)
+        # peak month median commit size (using LOC, computed below; defer the lookup)
         peak_month_data = {
             "label": f"{peak_ym[0]}-{peak_ym[1]:02d}",
             "commits": peak_count,
@@ -1174,8 +1174,10 @@ td.dim { color:var(--dim); font-size:12px }
   <div class="card span-3"><h2>Reverts and fixups</h2><div class="stat" id="fix-n"></div><div class="stat-sub" id="fix-sub"></div></div>
   <div class="card span-3"><h2>PR merges</h2><div class="stat" id="pr-n"></div><div class="stat-sub" id="pr-sub"></div></div>
 
-  <div class="card span-12"><h2>Subject categories per year</h2><canvas id="chart-cats" style="max-height:320px"></canvas></div>
-  <div class="card span-6"><h2>Conventional-commits adoption</h2><canvas id="chart-conv"></canvas></div>
+  <div class="card span-12"><h2>Subject categories per year</h2><canvas id="chart-cats" style="max-height:320px"></canvas>
+    <div class="hint" id="cats-hint"></div></div>
+  <div class="card span-6"><h2>Conventional-commits adoption</h2><canvas id="chart-conv"></canvas>
+    <div class="hint" id="conv-hint"></div></div>
   <div class="card span-6"><h2>Top co-authors</h2><table id="t-coauthors"></table>
     <div class="hint" id="coauthor-hint"></div></div>
 </div>
@@ -1211,15 +1213,18 @@ td.dim { color:var(--dim); font-size:12px }
 
 <div class="section-hd">Identity and timezone</div>
 <div class="grid">
-  <div class="card span-6"><h2>Identities used</h2><table id="t-identities"></table></div>
+  <div class="card span-6"><h2>Identities used</h2><table id="t-identities"></table>
+    <div class="hint" id="identity-hint"></div></div>
   <div class="card span-6"><h2>Timezone (modal UTC offset per month)</h2><canvas id="chart-tz"></canvas>
     <div class="hint" id="tz-hint"></div></div>
 </div>
 
 <div class="section-hd">Repo lifecycle</div>
 <div class="grid">
-  <div class="card span-12 long-table"><h2>Per-repo lifecycle (top 50 by span)</h2><table id="t-lifecycle"></table></div>
-  <div class="card span-12 long-table"><h2>Cold-repo resurrections (gap of 90+ days)</h2><table id="t-resur"></table></div>
+  <div class="card span-12 long-table"><h2>Per-repo lifecycle (top 50 by span)</h2><table id="t-lifecycle"></table>
+    <div class="hint" id="lifecycle-hint"></div></div>
+  <div class="card span-12 long-table"><h2>Cold-repo resurrections (gap of 90+ days)</h2><table id="t-resur"></table>
+    <div class="hint" id="resur-hint"></div></div>
 </div>
 
 <div class="section-hd">Headlines</div>
@@ -1435,29 +1440,80 @@ new Chart(document.getElementById("chart-locyear"), { type:"bar", data:{ labels:
 {
   const conv = D.conv_commits;
   const lastConv = conv.pct.length ? conv.pct[conv.pct.length-1] : 0;
+  const firstConv = conv.pct.length ? conv.pct[0] : 0;
+  const lastYear = conv.years.length ? conv.years[conv.years.length-1] : "n/a";
+  const firstYear = conv.years.length ? conv.years[0] : "n/a";
   document.getElementById("conv-pct").textContent = lastConv + "%";
-  document.getElementById("conv-sub").textContent = "in " + (conv.years.length ? conv.years[conv.years.length-1] : "n/a");
-  document.getElementById("oops-n").textContent = fmt(D.oops_count);
-  document.getElementById("oops-sub").textContent = "subjects with oops/typo/hack/finally...";
-  document.getElementById("fix-n").textContent = fmt(D.revert_count + D.fixup_count);
-  document.getElementById("fix-sub").textContent = D.revert_count + " reverts, " + D.fixup_count + " fixups";
-  document.getElementById("pr-n").textContent = fmt(D.pr_total);
-  document.getElementById("pr-sub").textContent = D.pr_top_repos.length ? "top: " + D.pr_top_repos[0][0] + " (" + D.pr_top_repos[0][1] + ")" : "no PR-style merges";
+  document.getElementById("conv-sub").textContent =
+    conv.years.length > 1
+      ? "in " + lastYear + ", up from " + firstConv + "% in " + firstYear
+      : "in " + lastYear;
 
+  const oopsPct = D.total ? (100*D.oops_count/D.total).toFixed(2) : 0;
+  document.getElementById("oops-n").textContent = fmt(D.oops_count);
+  document.getElementById("oops-sub").textContent =
+    oopsPct + "% of " + fmt(D.total) + " commits use words like oops/typo/hack/finally/sigh.";
+
+  const fixTotal = D.revert_count + D.fixup_count;
+  const fixPct = D.total ? (100*fixTotal/D.total).toFixed(2) : 0;
+  document.getElementById("fix-n").textContent = fmt(fixTotal);
+  document.getElementById("fix-sub").textContent =
+    D.revert_count + " reverts + " + D.fixup_count + " fixups, " + fixPct + "% of all commits";
+
+  document.getElementById("pr-n").textContent = fmt(D.pr_total);
+  if (D.pr_total) {
+    const mergePctNum = D.merges ? 100*D.pr_total/D.merges : 0;
+    const mergePctStr = mergePctNum >= 1 ? mergePctNum.toFixed(0) + "%" : mergePctNum > 0 ? "<1%" : "0%";
+    const repoCount = D.pr_top_repos.length;
+    document.getElementById("pr-sub").textContent =
+      mergePctStr + " of your " + fmt(D.merges) + " merge commits are PR merges (the rest are 'Merge branch'). Top repo: " + D.pr_top_repos[0][0] + " (" + D.pr_top_repos[0][1] + ").";
+  } else {
+    document.getElementById("pr-sub").textContent = "No 'Merge pull request' commits found.";
+  }
+
+  // categories chart with overall summary
   const cats = D.subject_cat_year;
   const palette = ["#5ae0a3","#ff6b6b","#7cc4ff","#ffb36b","#b88dff","#dde47a","#6ee0ff","#ff8db5","#9ad79a","#aaaaaa"];
   const datasets = D.subject_categories.map((cat, i) => ({ label:cat, data:cats.series[cat], backgroundColor:palette[i%palette.length], stack:"s" }));
   new Chart(document.getElementById("chart-cats"), { type:"bar", data:{ labels:cats.years, datasets }, options:{ plugins:{legend:{labels:{color:"#8ea2bd"}}}, scales:{y:{grid:{color:"#1f2a39"}, stacked:true}, x:{grid:{display:false}, stacked:true}} }});
+  // dominant overall category (excluding 'merge' since that's already a separate top-level stat)
+  const cats_pairs = D.subject_cat_counts.filter(([n])=>n!=="merge"&&n!=="other");
+  cats_pairs.sort((a,b)=>b[1]-a[1]);
+  const otherEntry = D.subject_cat_counts.find(([n])=>n==="other");
+  const otherCount = otherEntry ? otherEntry[1] : 0;
+  const otherPct = D.total ? Math.round(100*otherCount/D.total) : 0;
+  const top1 = cats_pairs[0] ? cats_pairs[0] : null;
+  const top1Pct = top1 && D.total ? Math.round(100*top1[1]/D.total) : 0;
+  document.getElementById("cats-hint").textContent =
+    (top1 ? "Most common labelled category: " + top1[0] + " (" + fmt(top1[1]) + ", " + top1Pct + "%). " : "") +
+    otherPct + "% of subjects don't start with any conventional prefix.";
 
+  // conv adoption chart with crossing-point hint
   new Chart(document.getElementById("chart-conv"), { type:"line", data:{ labels:conv.years, datasets:[{ data:conv.pct, borderColor:"#7cc4ff", backgroundColor:"rgba(124,196,255,0.18)", fill:true, tension:0.25, pointRadius:3 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}, suggestedMax:100, ticks:{callback:v=>v+"%"}}, x:{grid:{display:false}}} }});
+  let firstNonZero = -1;
+  for (let i = 0; i < conv.pct.length; i++) if (conv.pct[i] > 0) { firstNonZero = i; break; }
+  let firstAbove10 = -1;
+  for (let i = 0; i < conv.pct.length; i++) if (conv.pct[i] >= 10) { firstAbove10 = i; break; }
+  document.getElementById("conv-hint").textContent =
+    "% of subjects matching feat/fix/chore/refactor/docs/style/test/perf/build/ci/revert(scope)?: format. " +
+    (firstNonZero >= 0 ? "First measurable adoption: " + conv.years[firstNonZero] + " (" + conv.pct[firstNonZero] + "%). " : "Never adopted. ") +
+    (firstAbove10 >= 0 ? "Crossed 10% in " + conv.years[firstAbove10] + "." : "Never crossed 10%.");
 
   const tco = document.getElementById("t-coauthors");
   if (!D.top_coauthors.length) {
     const tr=document.createElement("tr"); tr.innerHTML='<td class="dim">No co-authored-by trailers.</td>'; tco.appendChild(tr);
-  } else D.top_coauthors.forEach(([name,n]) => {
-    const tr=document.createElement("tr"); tr.innerHTML=`<td>${name}</td><td class="num">${fmt(n)}</td>`; tco.appendChild(tr);
-  });
-  document.getElementById("coauthor-hint").textContent = D.coauthor_total ? D.coauthor_total + " mentions across " + D.coauthor_distinct + " co-authors." : "";
+    document.getElementById("coauthor-hint").textContent = "No commit body has a Co-authored-by trailer.";
+  } else {
+    D.top_coauthors.forEach(([name,n]) => {
+      const tr=document.createElement("tr"); tr.innerHTML=`<td>${name}</td><td class="num">${fmt(n)}</td>`; tco.appendChild(tr);
+    });
+    const topShare = D.coauthor_total ? Math.round(100*D.top_coauthors[0][1]/D.coauthor_total) : 0;
+    const coPct = D.total ? (100*D.coauthor_total/D.total).toFixed(1) : 0;
+    document.getElementById("coauthor-hint").textContent =
+      D.coauthor_total + " mentions across " + D.coauthor_distinct + " distinct people. " +
+      "Top one was " + topShare + "% of co-author lines. " +
+      coPct + "% of your commits cite a co-author.";
+  }
 }
 
 // --- code patterns ---
@@ -1542,15 +1598,44 @@ if (D.loc.survival && D.loc.survival.enabled) {
     tr.innerHTML = `<td>${name}<br><span class="dim">${email}</span></td><td class="num">${fs.slice(0,10)} -> ${ls.slice(0,10)}<br><span class="dim">${fmt(ct)} commits</span></td>`;
     t.appendChild(tr);
   });
+  if (D.identities.length) {
+    const totalCommits = D.identities.reduce((a,r)=>a+r[4],0);
+    const top = D.identities.slice().sort((a,b)=>b[4]-a[4])[0];
+    const topPct = totalCommits ? Math.round(100*top[4]/totalCommits) : 0;
+    const oldest = D.identities.slice().sort((a,b)=>a[2]<b[2]?-1:1)[0];
+    document.getElementById("identity-hint").textContent =
+      D.identities.length + " distinct (name, email) pairs. Most-used: " +
+      top[0] + " <" + top[1] + "> (" + topPct + "% of commits). " +
+      "Earliest: " + oldest[0] + " from " + oldest[2].slice(0,10) + ".";
+  }
 }
 
 // --- timezone ---
 {
   const tz = D.timezone;
   new Chart(document.getElementById("chart-tz"), { type:"line", data:{ labels:tz.labels, datasets:[{ data:tz.modal, borderColor:"#ffb36b", backgroundColor:"rgba(255,179,107,0.15)", fill:false, stepped:true, pointRadius:0 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}, ticks:{callback:v=>(v>=0?"+":"")+v+"h"}}, x:{grid:{display:false}, ticks:{maxTicksLimit:18}}} }});
-  document.getElementById("tz-hint").textContent = tz.distinct.length > 1
-    ? tz.distinct.length + " distinct offsets, " + tz.transitions.length + " transitions"
-    : "single offset throughout";
+  // share of months for each offset
+  const offsetShare = {};
+  for (const off of tz.modal) offsetShare[off] = (offsetShare[off]||0) + 1;
+  let dominantOff = null, dominantN = 0;
+  for (const k in offsetShare) if (offsetShare[k] > dominantN) { dominantN = offsetShare[k]; dominantOff = parseFloat(k); }
+  const totalMonths = tz.modal.length;
+  const dPct = totalMonths ? Math.round(100*dominantN/totalMonths) : 0;
+  const fmtOff = h => (h>=0?"+":"") + h + "h";
+  if (totalMonths === 0) {
+    document.getElementById("tz-hint").textContent = "No timezone data.";
+  } else if (tz.distinct.length === 1) {
+    document.getElementById("tz-hint").textContent =
+      "Single offset throughout: " + fmtOff(tz.distinct[0]) + ". You haven't moved.";
+  } else {
+    const distinctStr = tz.distinct.map(fmtOff).join(", ");
+    const story =
+      tz.transitions.length === 0
+        ? "but the modal offset every month was " + fmtOff(dominantOff) + ", so those other offsets show up as occasional commits, not a base relocation. Probably travel."
+        : "modal offset flipped " + tz.transitions.length + " times. Likely relocation(s).";
+    document.getElementById("tz-hint").textContent =
+      tz.distinct.length + " offsets ever appeared in your commits (" + distinctStr + "); " + story;
+  }
 }
 
 // --- repo lifecycle ---
@@ -1561,16 +1646,41 @@ if (D.loc.survival && D.loc.survival.enabled) {
     tr.innerHTML = `<td>${r.repo}</td><td class="num">${r.first.slice(0,10)} -> ${r.last.slice(0,10)}<br><span class="dim">${r.span_days}d, ${fmt(r.commits)} commits, peak ${r.peak} (${r.peak_count})</span></td>`;
     t.appendChild(tr);
   });
+  if (D.repo_lifecycle.length) {
+    const longestSpan = D.repo_lifecycle[0]; // already sorted by span_days desc
+    const mostCommits = D.repo_lifecycle.slice().sort((a,b)=>b.commits-a.commits)[0];
+    const oldest = D.repo_lifecycle.slice().sort((a,b)=>a.first<b.first?-1:1)[0];
+    const newest = D.repo_lifecycle.slice().sort((a,b)=>a.first>b.first?-1:1)[0];
+    document.getElementById("lifecycle-hint").textContent =
+      D.repos_count + " repos with activity. " +
+      "Longest-lived: " + longestSpan.repo + " (" + longestSpan.span_days + "d span). " +
+      "Most commits: " + mostCommits.repo + " (" + fmt(mostCommits.commits) + "). " +
+      "Oldest start: " + oldest.repo + " (" + oldest.first.slice(0,10) + "). " +
+      "Newest start: " + newest.repo + " (" + newest.first.slice(0,10) + ").";
+  }
 }
 
 // --- resurrections ---
 {
   const t = document.getElementById("t-resur");
+  const hint = document.getElementById("resur-hint");
   if (!D.resurrections.length) {
     const tr=document.createElement("tr"); tr.innerHTML='<td class="dim">No resurrections.</td>'; t.appendChild(tr);
-  } else D.resurrections.forEach(r => {
-    const tr=document.createElement("tr"); tr.innerHTML=`<td>${r.repo}</td><td class="num">${r.from} -> ${r.to}<br><span class="dim">${r.days}d gap</span></td>`; t.appendChild(tr);
-  });
+    hint.textContent = "No repo went 90+ days without a commit and then came back.";
+  } else {
+    D.resurrections.forEach(r => {
+      const tr=document.createElement("tr"); tr.innerHTML=`<td>${r.repo}</td><td class="num">${r.from} -> ${r.to}<br><span class="dim">${r.days}d gap</span></td>`; t.appendChild(tr);
+    });
+    const longest = D.resurrections[0]; // sorted by days desc
+    const repoCount = {};
+    for (const r of D.resurrections) repoCount[r.repo] = (repoCount[r.repo]||0) + 1;
+    let mostRevived = null, mostN = 0;
+    for (const k in repoCount) if (repoCount[k] > mostN) { mostN = repoCount[k]; mostRevived = k; }
+    hint.textContent =
+      D.resurrections.length + " resurrections (gaps of 90+ days). " +
+      "Longest: " + longest.days + "d in " + longest.repo + ". " +
+      (mostN > 1 ? "Most-resurrected repo: " + mostRevived + " (" + mostN + " comebacks)." : "");
+  }
 }
 
 // --- most intense week ---
