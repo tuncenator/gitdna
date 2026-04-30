@@ -27,6 +27,22 @@ NOISE_PATTERNS = [
 ]
 NOISE_RE = re.compile("|".join(NOISE_PATTERNS), re.I)
 
+SUBJECT_BINS = [
+    ("feat",     re.compile(r"^(feat|add|new|introduc|implement|create|support)", re.I)),
+    ("fix",      re.compile(r"^(fix|bug|patch|hotfix|repair|resolve|correct)", re.I)),
+    ("refactor", re.compile(r"^(refactor|clean|cleanup|rename|move|reorganiz|simplif|tidy|extract|inline)", re.I)),
+    ("docs",     re.compile(r"^(doc|docs|readme|comment)", re.I)),
+    ("chore",    re.compile(r"^(chore|bump|deps|dep|update|upgrade|build|ci|release|version)", re.I)),
+    ("test",     re.compile(r"^(test|tests|spec|cover)", re.I)),
+    ("style",    re.compile(r"^(style|format|lint|prettier|fmt)", re.I)),
+    ("revert",   re.compile(r"^(revert|undo|rollback)", re.I)),
+    ("merge",    re.compile(r"^merge", re.I)),
+]
+CONV_RE = re.compile(r"^(feat|fix|chore|refactor|docs|style|test|perf|build|ci|revert)(\([^)]*\))?!?:\s", re.I)
+OOPS_RE = re.compile(r"\b(oops|wtf|ugh|argh|finally|whoops|smh|typo|hack|kludge|sigh)\b", re.I)
+FIXUP_RE = re.compile(r"^(fixup!|squash!|amend!)", re.I)
+PR_MERGE_RE = re.compile(r"^Merge\s+(pull\s+request|PR)\s+#(\d+)", re.I)
+
 
 def find_repos(root: Path, max_depth: int) -> list[Path]:
     repos = []
@@ -428,6 +444,7 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
     py_first_hours = collections.defaultdict(list)
     py_weekend = collections.defaultdict(lambda: [0, 0])
     py_evening = collections.defaultdict(lambda: [0, 0])
+    py_night = collections.defaultdict(lambda: [0, 0])
     first_commit_per_day = {}
     for c in commits:
         d = c[2]
@@ -438,8 +455,11 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
         if d.weekday() >= 5:
             py_weekend[d.year][0] += 1
         py_evening[d.year][1] += 1
-        if d.hour >= 18 or d.hour < 7:
+        if 18 <= d.hour < 24:
             py_evening[d.year][0] += 1
+        py_night[d.year][1] += 1
+        if 0 <= d.hour < 7:
+            py_night[d.year][0] += 1
         prev = first_commit_per_day.get(date)
         if prev is None or d < prev:
             first_commit_per_day[date] = d
@@ -452,6 +472,8 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
                       for y in chrono_years]
     chrono_evening = [round(100 * py_evening[y][0] / py_evening[y][1], 1) if py_evening[y][1] else 0
                       for y in chrono_years]
+    chrono_night = [round(100 * py_night[y][0] / py_night[y][1], 1) if py_night[y][1] else 0
+                    for y in chrono_years]
 
     first_hour_dist = [0] * 24
     for dval in first_commit_per_day.values():
@@ -465,6 +487,13 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
     ent_keys = sorted(pm_repos.keys())
     entropy_labels = [f"{y}-{m:02d}" for y, m in ent_keys]
     entropy_values = [round(shannon_entropy(pm_repos[k]), 3) for k in ent_keys]
+    py_entropy_acc = collections.defaultdict(list)
+    for (y, _m), val in zip(ent_keys, entropy_values):
+        py_entropy_acc[y].append(val)
+    chrono_repo_entropy = [
+        round(sum(py_entropy_acc.get(y, [0])) / max(1, len(py_entropy_acc.get(y, [0]))), 3)
+        for y in chrono_years
+    ]
 
     # --- vacations: gaps between active days >= 7 ---
     days_set = sorted(day_counter.keys())
@@ -478,6 +507,87 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
 
     # --- repo Gini ---
     repo_gini_val = round(gini(list(repos.values())), 3)
+
+    # --- worst week ever: sliding 7-day window with most commits ---
+    if days_set:
+        first_day = days_set[0]
+        last_day = days_set[-1]
+        per_day = {d: day_counter[d] for d in days_set}
+        # walk every day in span; sliding 7-day count
+        worst_count = 0
+        worst_end = first_day
+        cur = first_day
+        from collections import deque
+        win = deque()
+        running = 0
+        cur = first_day
+        while cur <= last_day:
+            running += per_day.get(cur, 0)
+            win.append(cur)
+            while win and (cur - win[0]).days >= 7:
+                running -= per_day.get(win.popleft(), 0)
+            if running > worst_count:
+                worst_count = running
+                worst_end = cur
+            cur += dt.timedelta(days=1)
+        worst_start = worst_end - dt.timedelta(days=6)
+        # hours profile during this week
+        worst_hours = [0] * 24
+        worst_dows = [0] * 7
+        worst_repos = collections.Counter()
+        worst_total_loc = 0
+        for c in commits:
+            if worst_start <= c[2].date() <= worst_end:
+                worst_hours[c[2].hour] += 1
+                worst_dows[c[2].weekday()] += 1
+                worst_repos[c[0]] += 1
+        worst_week = {
+            "start": worst_start.isoformat(),
+            "end": worst_end.isoformat(),
+            "commits": worst_count,
+            "hours": worst_hours,
+            "dows": worst_dows,
+            "top_repos": worst_repos.most_common(5),
+        }
+    else:
+        worst_week = {"start": "", "end": "", "commits": 0, "hours": [0]*24, "dows": [0]*7, "top_repos": []}
+
+    # --- all-time daily counts for the multi-year calendar ---
+    all_daily = {d.isoformat(): n for d, n in day_counter.items()}
+
+    # --- peak-month decoded: which month, then dominant repo/category/size ---
+    if months:
+        peak_ym, peak_count = months.most_common(1)[0]
+        peak_repos = collections.Counter()
+        peak_cats = collections.Counter()
+        peak_subjs = []
+        for c in commits:
+            if (c[2].year, c[2].month) == peak_ym:
+                peak_repos[c[0]] += 1
+                subj = c[6].strip()
+                if subj:
+                    peak_subjs.append(subj)
+                    cat = "other"
+                    for label, rx in SUBJECT_BINS:
+                        if rx.search(subj):
+                            cat = label
+                            break
+                    peak_cats[cat] += 1
+        peak_top_repo = peak_repos.most_common(1)[0] if peak_repos else ("", 0)
+        peak_top_cat = peak_cats.most_common(1)[0] if peak_cats else ("", 0)
+        # peak month median commit size (using LOC, computed below — defer the lookup)
+        peak_month_data = {
+            "label": f"{peak_ym[0]}-{peak_ym[1]:02d}",
+            "commits": peak_count,
+            "top_repo": peak_top_repo[0],
+            "top_repo_count": peak_top_repo[1],
+            "top_category": peak_top_cat[0],
+            "top_category_count": peak_top_cat[1],
+            "ym": peak_ym,
+        }
+    else:
+        peak_month_data = {"label": "", "commits": 0, "top_repo": "", "top_repo_count": 0,
+                           "top_category": "", "top_category_count": 0, "ym": None}
 
     # --- timezone migration: modal UTC offset (in hours) per month ---
     tz_per_month = collections.defaultdict(collections.Counter)
@@ -539,22 +649,6 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
     repo_lifecycle.sort(key=lambda r: r["span_days"], reverse=True)
 
     # --- subject classifier: bin each commit subject into one category ---
-    SUBJECT_BINS = [
-        ("feat",     re.compile(r"^(feat|add|new|introduc|implement|create|support)", re.I)),
-        ("fix",      re.compile(r"^(fix|bug|patch|hotfix|repair|resolve|correct)", re.I)),
-        ("refactor", re.compile(r"^(refactor|clean|cleanup|rename|move|reorganiz|simplif|tidy|extract|inline)", re.I)),
-        ("docs",     re.compile(r"^(doc|docs|readme|comment)", re.I)),
-        ("chore",    re.compile(r"^(chore|bump|deps|dep|update|upgrade|build|ci|release|version)", re.I)),
-        ("test",     re.compile(r"^(test|tests|spec|cover)", re.I)),
-        ("style",    re.compile(r"^(style|format|lint|prettier|fmt)", re.I)),
-        ("revert",   re.compile(r"^(revert|undo|rollback)", re.I)),
-        ("merge",    re.compile(r"^merge", re.I)),
-    ]
-    CONV_RE = re.compile(r"^(feat|fix|chore|refactor|docs|style|test|perf|build|ci|revert)(\([^)]*\))?!?:\s", re.I)
-    OOPS_RE = re.compile(r"\b(oops|wtf|ugh|argh|finally|whoops|smh|typo|hack|kludge|sigh)\b", re.I)
-    FIXUP_RE = re.compile(r"^(fixup!|squash!|amend!)", re.I)
-    PR_MERGE_RE = re.compile(r"^Merge\s+(pull\s+request|PR)\s+#(\d+)", re.I)
-
     cat_counts = collections.Counter()
     cat_per_year = collections.defaultdict(lambda: collections.Counter())
     conv_per_year = collections.defaultdict(lambda: [0, 0])  # [conv, total]
@@ -741,6 +835,30 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
     top_repos_loc = [(r, a, repo_del.get(r, 0)) for r, a in top_repos_loc_pairs]
     year_loc_items = sorted(loc_by_year.items())
 
+    # enrich peak month with LOC stats now that commit_add exists
+    if peak_month_data.get("ym") is not None:
+        ym = peak_month_data["ym"]
+        peak_sizes = []
+        peak_ext = collections.Counter()
+        for sha, add in commit_add.items():
+            meta = commit_meta.get(sha)
+            if not meta:
+                continue
+            d = meta[2]
+            if (d.year, d.month) == ym:
+                peak_sizes.append(add)
+        for repo, sha, iso, add, dele, path in loc_rows:
+            meta = commit_meta.get(sha)
+            if not meta:
+                continue
+            if (meta[2].year, meta[2].month) == ym and not NOISE_RE.search(path):
+                peak_ext[ext_of(path)] += add
+        peak_month_data["median_commit_size"] = int(statistics.median(peak_sizes)) if peak_sizes else 0
+        top_lang = peak_ext.most_common(1)
+        peak_month_data["top_language"] = top_lang[0][0] if top_lang else ""
+        peak_month_data["top_language_lines"] = top_lang[0][1] if top_lang else 0
+        peak_month_data.pop("ym", None)
+
     # commit-size distribution (additions only, post-noise filter)
     commit_sizes = list(commit_add.values())
     size_buckets = [0, 0, 0, 0, 0, 0]  # 0, 1-10, 11-100, 101-500, 501-2000, 2000+
@@ -850,6 +968,8 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
             "first_commit_hour": chrono_first,
             "weekend_pct": chrono_weekend,
             "evening_pct": chrono_evening,
+            "night_pct": chrono_night,
+            "repo_entropy": chrono_repo_entropy,
         },
         "first_hour_dist": first_hour_dist,
         "repo_entropy": {"labels": entropy_labels, "values": entropy_values},
@@ -881,6 +1001,9 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
         },
         "resurrections": resurrections[:25],
         "repo_lifecycle": repo_lifecycle[:50],
+        "worst_week": worst_week,
+        "all_daily": all_daily,
+        "peak_month": peak_month_data,
         "loc": {
             "commits_with_data": len(commit_add_raw),
             "total_add_raw": total_add_raw,
