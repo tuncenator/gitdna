@@ -7,9 +7,11 @@ import collections
 import concurrent.futures as cf
 import datetime as dt
 import json
+import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +26,22 @@ NOISE_PATTERNS = [
     r"\.snap$",
 ]
 NOISE_RE = re.compile("|".join(NOISE_PATTERNS), re.I)
+
+SUBJECT_BINS = [
+    ("feat",     re.compile(r"^(feat|add|new|introduc|implement|create|support)", re.I)),
+    ("fix",      re.compile(r"^(fix|bug|patch|hotfix|repair|resolve|correct)", re.I)),
+    ("refactor", re.compile(r"^(refactor|clean|cleanup|rename|move|reorganiz|simplif|tidy|extract|inline)", re.I)),
+    ("docs",     re.compile(r"^(doc|docs|readme|comment)", re.I)),
+    ("chore",    re.compile(r"^(chore|bump|deps|dep|update|upgrade|build|ci|release|version)", re.I)),
+    ("test",     re.compile(r"^(test|tests|spec|cover)", re.I)),
+    ("style",    re.compile(r"^(style|format|lint|prettier|fmt)", re.I)),
+    ("revert",   re.compile(r"^(revert|undo|rollback)", re.I)),
+    ("merge",    re.compile(r"^merge", re.I)),
+]
+CONV_RE = re.compile(r"^(feat|fix|chore|refactor|docs|style|test|perf|build|ci|revert)(\([^)]*\))?!?:\s", re.I)
+OOPS_RE = re.compile(r"\b(oops|wtf|ugh|argh|finally|whoops|smh|typo|hack|kludge|sigh)\b", re.I)
+FIXUP_RE = re.compile(r"^(fixup!|squash!|amend!)", re.I)
+PR_MERGE_RE = re.compile(r"^Merge\s+(pull\s+request|PR)\s+#(\d+)", re.I)
 
 
 def find_repos(root: Path, max_depth: int) -> list[Path]:
@@ -58,19 +76,27 @@ def run_git(repo: Path, args: list[str], timeout: int) -> str:
 
 def extract_repo(repo: Path, author_pattern: str, timeout: int) -> tuple[list[tuple], list[tuple]]:
     name = repo.name
+    # %P = parent SHAs (space-separated, 2+ means merge); trailer field carries
+    # co-authored-by lines joined by 0x1f to keep them on one log line.
     log = run_git(
         repo,
         ["log", "--all", "--extended-regexp", f"--author={author_pattern}",
-         "--pretty=format:%H%x09%aI%x09%ae%x09%an%x09%s"],
+         "--pretty=format:%H%x09%aI%x09%ae%x09%an%x09%P%x09%s%x09"
+         "%(trailers:key=Co-authored-by,valueonly,separator=%x1f)"],
         timeout,
     )
     commits = []
     for line in log.splitlines():
-        parts = line.split("\t", 4)
-        if len(parts) < 5:
+        parts = line.split("\t", 6)
+        if len(parts) >= 7:
+            sha, iso, email, who, parents, subj, coauthors = parts
+        elif len(parts) == 6:
+            # older git without trailers support
+            sha, iso, email, who, parents, subj = parts
+            coauthors = ""
+        else:
             continue
-        sha, iso, email, who, subj = parts
-        commits.append((name, sha, iso, email, who, subj))
+        commits.append((name, sha, iso, email, who, parents, subj, coauthors))
 
     # numstat in a second call (avoids parsing complexity, and skips merges)
     nums = run_git(
@@ -103,6 +129,65 @@ def extract_repo(repo: Path, author_pattern: str, timeout: int) -> tuple[list[tu
     return commits, loc_rows
 
 
+def author_needles(pattern: str) -> list[str]:
+    """Lowercase tokens to match against a blame line's author or email."""
+    parts = re.split(r"\\\||\|", pattern)
+    return [p.strip().lower() for p in parts if p.strip()]
+
+
+def blame_repo(repo: Path, needles: list[str], timeout: int) -> dict[int, int]:
+    """Count lines in HEAD authored by user, bucketed by their author-year."""
+    out = run_git(repo, ["ls-tree", "-r", "HEAD", "--name-only"], timeout)
+    if not out:
+        return {}
+    survived: collections.Counter = collections.Counter()
+    files = [f for f in out.splitlines() if f and not NOISE_RE.search(f)]
+    for f in files:
+        blame = run_git(repo, ["blame", "--porcelain", "HEAD", "--", f], timeout)
+        if not blame:
+            continue
+        meta: dict[str, list] = {}
+        counts: collections.Counter = collections.Counter()
+        cur_sha: str | None = None
+        for line in blame.splitlines():
+            if line.startswith("\t"):
+                if cur_sha:
+                    counts[cur_sha] += 1
+                continue
+            if not line:
+                continue
+            head = line.split(" ", 1)[0]
+            if len(head) == 40 and all(c in "0123456789abcdef" for c in head):
+                cur_sha = head
+                meta.setdefault(cur_sha, ["", "", 0])
+                continue
+            if cur_sha is None:
+                continue
+            key, _, val = line.partition(" ")
+            if key == "author":
+                meta[cur_sha][0] = val
+            elif key == "author-mail":
+                meta[cur_sha][1] = val.strip().lstrip("<").rstrip(">")
+            elif key == "author-time":
+                try:
+                    meta[cur_sha][2] = int(val)
+                except ValueError:
+                    meta[cur_sha][2] = 0
+        for sha, n in counts.items():
+            m = meta.get(sha)
+            if not m:
+                continue
+            author, email, t = m
+            blob = (author + " " + email).lower()
+            if not any(needle in blob for needle in needles):
+                continue
+            if not t:
+                continue
+            year = dt.datetime.fromtimestamp(t, dt.timezone.utc).year
+            survived[year] += n
+    return dict(survived)
+
+
 def ext_of(path: str) -> str:
     if " => " in path:
         path = path.split(" => ", 1)[1]
@@ -114,7 +199,82 @@ def ext_of(path: str) -> str:
     return "(none)"
 
 
-def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
+def _build_survival(loc_by_year: dict, survival: dict[int, int]) -> dict:
+    """Combine 'lines added per year' with 'lines from year still alive in HEAD'."""
+    if not survival:
+        return {"enabled": False, "years": [], "added": [], "alive": [], "pct": [],
+                "total_added": 0, "total_alive": 0, "overall_pct": 0}
+    years = sorted(set(loc_by_year.keys()) | set(survival.keys()))
+    added = [loc_by_year.get(y, [0, 0])[0] for y in years]
+    alive = [survival.get(y, 0) for y in years]
+    pct = [round(100 * a / d, 1) if d else 0 for a, d in zip(alive, added)]
+    total_added = sum(added)
+    total_alive = sum(alive)
+    return {
+        "enabled": True,
+        "years": years,
+        "added": added,
+        "alive": alive,
+        "pct": pct,
+        "total_added": total_added,
+        "total_alive": total_alive,
+        "overall_pct": round(100 * total_alive / total_added, 1) if total_added else 0,
+    }
+
+
+def percentile(xs: list, p: float) -> float:
+    if not xs:
+        return 0
+    xs = sorted(xs)
+    k = (len(xs) - 1) * p / 100.0
+    f = int(k)
+    c = min(f + 1, len(xs) - 1)
+    return xs[f] + (xs[c] - xs[f]) * (k - f)
+
+
+def circular_mean_hours(hours_list: list[float]) -> float:
+    """Mean of values on a 24-hour clock, treating 23 and 0 as adjacent."""
+    if not hours_list:
+        return 0.0
+    angles = [h * 2 * math.pi / 24 for h in hours_list]
+    sx = sum(math.sin(a) for a in angles)
+    cx = sum(math.cos(a) for a in angles)
+    a = math.atan2(sx, cx)
+    if a < 0:
+        a += 2 * math.pi
+    return a * 24 / (2 * math.pi)
+
+
+def shannon_entropy(counter_like) -> float:
+    total = sum(counter_like.values()) if hasattr(counter_like, "values") else sum(counter_like)
+    if total == 0:
+        return 0.0
+    vals = counter_like.values() if hasattr(counter_like, "values") else counter_like
+    h = 0.0
+    for v in vals:
+        if v <= 0:
+            continue
+        p = v / total
+        h -= p * math.log2(p)
+    return h
+
+
+def gini(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    xs = sorted(values)
+    n = len(xs)
+    s = sum(xs)
+    if s == 0:
+        return 0.0
+    cum = 0.0
+    for i, x in enumerate(xs, 1):
+        cum += i * x
+    return (2 * cum) / (n * s) - (n + 1) / n
+
+
+def analyze(commits: list[tuple], loc_rows: list[tuple], title: str,
+            survival: dict[int, int] | None = None) -> dict:
     # dedupe commits by sha
     seen = set()
     uniq = []
@@ -131,7 +291,8 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
             d = dt.datetime.fromisoformat(c[2].replace("Z", "+00:00"))
         except ValueError:
             continue
-        parsed.append((c[0], c[1], d, c[3], c[4], c[5]))
+        # (repo, sha, datetime, email, name, parents, subject, coauthors)
+        parsed.append((c[0], c[1], d, c[3], c[4], c[5], c[6], c[7]))
     commits = parsed
     if not commits:
         raise SystemExit("No commits matched. Check --author pattern.")
@@ -145,7 +306,7 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
     repos = collections.Counter()
     day_counter = collections.Counter()
 
-    for repo, sha, d, email, name, subj in commits:
+    for repo, sha, d, email, name, parents, subj, coauthors in commits:
         hours[d.hour] += 1
         dows[d.weekday()] += 1
         heat[d.weekday()][d.hour] += 1
@@ -219,12 +380,13 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
 
     verbs = collections.Counter()
     for c in commits:
-        m = re.match(r"^([A-Za-z]+)", c[5].strip())
+        m = re.match(r"^([A-Za-z]+)", c[6].strip())
         if m:
             verbs[m.group(1).lower()] += 1
     top_verbs = verbs.most_common(12)
 
-    merges = sum(1 for c in commits if c[5].lower().startswith("merge"))
+    # parents field: space-separated parent SHAs. 2+ parents = merge commit.
+    merges = sum(1 for c in commits if len(c[5].split()) >= 2)
     year_items = sorted(years.items())
 
     first = min(times)
@@ -232,7 +394,342 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
     span_days = (last_t.date() - first.date()).days
     active_days = len(day_counter)
 
+    # --- sessions: contiguous commits with <= 60 min between them ---
+    SESSION_GAP = dt.timedelta(minutes=60)
+    sessions = []
+    s_start = times[0]
+    s_count = 1
+    for i in range(1, len(times)):
+        if times[i] - times[i - 1] > SESSION_GAP:
+            sessions.append((s_start, times[i - 1], s_count))
+            s_start = times[i]
+            s_count = 1
+        else:
+            s_count += 1
+    sessions.append((s_start, times[-1], s_count))
+    session_minutes = [(s[1] - s[0]).total_seconds() / 60.0 for s in sessions]
+    session_counts = [s[2] for s in sessions]
+    session_buckets = [0, 0, 0, 0, 0]  # <30, 30-60, 60-120, 120-240, 240+
+    for m in session_minutes:
+        if m < 30:
+            session_buckets[0] += 1
+        elif m < 60:
+            session_buckets[1] += 1
+        elif m < 120:
+            session_buckets[2] += 1
+        elif m < 240:
+            session_buckets[3] += 1
+        else:
+            session_buckets[4] += 1
+    longest_session = max(sessions, key=lambda s: (s[1] - s[0]).total_seconds())
+    busiest_session = max(sessions, key=lambda s: s[2])
+    sessions_per_iso_week = collections.Counter()
+    for s in sessions:
+        iso = s[0].isocalendar()
+        sessions_per_iso_week[(iso[0], iso[1])] += 1
+
+    # --- burstiness: B = (sigma - mu) / (sigma + mu) on inter-commit seconds ---
+    inter = [(times[i] - times[i - 1]).total_seconds() for i in range(1, len(times))]
+    if inter:
+        mu = sum(inter) / len(inter)
+        var = sum((x - mu) ** 2 for x in inter) / len(inter)
+        sigma = math.sqrt(var)
+        burstiness = (sigma - mu) / (sigma + mu) if (sigma + mu) > 0 else 0.0
+    else:
+        mu = 0.0
+        burstiness = 0.0
+
+    # --- chronotype drift: per-year centroid hour, weekend %, evening % ---
+    py_hours = collections.defaultdict(list)
+    py_first_hours = collections.defaultdict(list)
+    py_weekend = collections.defaultdict(lambda: [0, 0])
+    py_evening = collections.defaultdict(lambda: [0, 0])
+    py_night = collections.defaultdict(lambda: [0, 0])
+    first_commit_per_day = {}
+    for c in commits:
+        d = c[2]
+        date = d.date()
+        h = d.hour + d.minute / 60.0
+        py_hours[d.year].append(h)
+        py_weekend[d.year][1] += 1
+        if d.weekday() >= 5:
+            py_weekend[d.year][0] += 1
+        py_evening[d.year][1] += 1
+        if 18 <= d.hour < 24:
+            py_evening[d.year][0] += 1
+        py_night[d.year][1] += 1
+        if 0 <= d.hour < 7:
+            py_night[d.year][0] += 1
+        prev = first_commit_per_day.get(date)
+        if prev is None or d < prev:
+            first_commit_per_day[date] = d
+    for date, dval in first_commit_per_day.items():
+        py_first_hours[date.year].append(dval.hour + dval.minute / 60.0)
+    chrono_years = sorted(py_hours.keys())
+    chrono_centroid = [round(circular_mean_hours(py_hours[y]), 2) for y in chrono_years]
+    chrono_first = [round(circular_mean_hours(py_first_hours[y]), 2) for y in chrono_years]
+    chrono_weekend = [round(100 * py_weekend[y][0] / py_weekend[y][1], 1) if py_weekend[y][1] else 0
+                      for y in chrono_years]
+    chrono_evening = [round(100 * py_evening[y][0] / py_evening[y][1], 1) if py_evening[y][1] else 0
+                      for y in chrono_years]
+    chrono_night = [round(100 * py_night[y][0] / py_night[y][1], 1) if py_night[y][1] else 0
+                    for y in chrono_years]
+
+    first_hour_dist = [0] * 24
+    for dval in first_commit_per_day.values():
+        first_hour_dist[dval.hour] += 1
+
+    # --- repo-concurrency entropy per month ---
+    pm_repos = collections.defaultdict(collections.Counter)
+    for c in commits:
+        d = c[2]
+        pm_repos[(d.year, d.month)][c[0]] += 1
+    ent_keys = sorted(pm_repos.keys())
+    entropy_labels = [f"{y}-{m:02d}" for y, m in ent_keys]
+    entropy_values = [round(shannon_entropy(pm_repos[k]), 3) for k in ent_keys]
+    py_entropy_acc = collections.defaultdict(list)
+    for (y, _m), val in zip(ent_keys, entropy_values):
+        py_entropy_acc[y].append(val)
+    chrono_repo_entropy = [
+        round(sum(py_entropy_acc.get(y, [0])) / max(1, len(py_entropy_acc.get(y, [0]))), 3)
+        for y in chrono_years
+    ]
+
+    # --- vacations: gaps between active days >= 7 ---
+    days_set = sorted(day_counter.keys())
+    vacations = []
+    for i in range(1, len(days_set)):
+        gap = (days_set[i] - days_set[i - 1]).days
+        if gap >= 7:
+            vacations.append((days_set[i - 1].isoformat(), days_set[i].isoformat(), gap))
+    vacations.sort(key=lambda v: v[2], reverse=True)
+    top_vacations = vacations[:20]
+
+    # --- repo Gini ---
+    repo_gini_val = round(gini(list(repos.values())), 3)
+
+    # --- worst week ever: sliding 7-day window with most commits ---
+    if days_set:
+        first_day = days_set[0]
+        last_day = days_set[-1]
+        per_day = {d: day_counter[d] for d in days_set}
+        # walk every day in span; sliding 7-day count
+        worst_count = 0
+        worst_end = first_day
+        cur = first_day
+        from collections import deque
+        win = deque()
+        running = 0
+        cur = first_day
+        while cur <= last_day:
+            running += per_day.get(cur, 0)
+            win.append(cur)
+            while win and (cur - win[0]).days >= 7:
+                running -= per_day.get(win.popleft(), 0)
+            if running > worst_count:
+                worst_count = running
+                worst_end = cur
+            cur += dt.timedelta(days=1)
+        worst_start = worst_end - dt.timedelta(days=6)
+        # hours profile during this week
+        worst_hours = [0] * 24
+        worst_dows = [0] * 7
+        worst_repos = collections.Counter()
+        worst_total_loc = 0
+        for c in commits:
+            if worst_start <= c[2].date() <= worst_end:
+                worst_hours[c[2].hour] += 1
+                worst_dows[c[2].weekday()] += 1
+                worst_repos[c[0]] += 1
+        worst_week = {
+            "start": worst_start.isoformat(),
+            "end": worst_end.isoformat(),
+            "commits": worst_count,
+            "hours": worst_hours,
+            "dows": worst_dows,
+            "top_repos": worst_repos.most_common(5),
+        }
+    else:
+        worst_week = {"start": "", "end": "", "commits": 0, "hours": [0]*24, "dows": [0]*7, "top_repos": []}
+
+    # --- all-time daily counts for the multi-year calendar ---
+    all_daily = {d.isoformat(): n for d, n in day_counter.items()}
+
+    # --- peak-month decoded: which month, then dominant repo/category/size ---
+    if months:
+        peak_ym, peak_count = months.most_common(1)[0]
+        peak_repos = collections.Counter()
+        peak_cats = collections.Counter()
+        peak_subjs = []
+        for c in commits:
+            if (c[2].year, c[2].month) == peak_ym:
+                peak_repos[c[0]] += 1
+                subj = c[6].strip()
+                if subj:
+                    peak_subjs.append(subj)
+                    cat = "other"
+                    for label, rx in SUBJECT_BINS:
+                        if rx.search(subj):
+                            cat = label
+                            break
+                    peak_cats[cat] += 1
+        peak_top_repo = peak_repos.most_common(1)[0] if peak_repos else ("", 0)
+        peak_top_cat = peak_cats.most_common(1)[0] if peak_cats else ("", 0)
+        # peak month median commit size (using LOC, computed below; defer the lookup)
+        peak_month_data = {
+            "label": f"{peak_ym[0]}-{peak_ym[1]:02d}",
+            "commits": peak_count,
+            "top_repo": peak_top_repo[0],
+            "top_repo_count": peak_top_repo[1],
+            "top_category": peak_top_cat[0],
+            "top_category_count": peak_top_cat[1],
+            "ym": peak_ym,
+        }
+    else:
+        peak_month_data = {"label": "", "commits": 0, "top_repo": "", "top_repo_count": 0,
+                           "top_category": "", "top_category_count": 0, "ym": None}
+
+    # --- timezone migration: modal UTC offset (in hours) per month ---
+    tz_per_month = collections.defaultdict(collections.Counter)
+    for c in commits:
+        off = c[2].utcoffset()
+        if off is None:
+            continue
+        h = off.total_seconds() / 3600.0
+        tz_per_month[(c[2].year, c[2].month)][h] += 1
+    tz_keys = sorted(tz_per_month.keys())
+    tz_labels = [f"{y}-{m:02d}" for y, m in tz_keys]
+    tz_modal = [tz_per_month[k].most_common(1)[0][0] for k in tz_keys]
+    tz_distinct = sorted({h for c in tz_per_month.values() for h in c})
+    # transitions: months where modal differs from previous
+    tz_transitions = []
+    for i in range(1, len(tz_keys)):
+        if tz_modal[i] != tz_modal[i - 1]:
+            tz_transitions.append({
+                "from": tz_labels[i - 1],
+                "to": tz_labels[i],
+                "from_offset": tz_modal[i - 1],
+                "to_offset": tz_modal[i],
+            })
+
+    # --- cold-repo resurrections: per repo, gaps >= 90 days between commits ---
+    per_repo_dates = collections.defaultdict(list)
+    for c in commits:
+        per_repo_dates[c[0]].append(c[2])
+    resurrections = []
+    repo_lifecycle = []  # (repo, first, last, span_days, peak_month, peak_count)
+    for repo, ds in per_repo_dates.items():
+        ds = sorted(ds)
+        first_d = ds[0]
+        last_d = ds[-1]
+        # peak month for this repo
+        m_count = collections.Counter()
+        for d in ds:
+            m_count[(d.year, d.month)] += 1
+        peak_m, peak_n = m_count.most_common(1)[0]
+        repo_lifecycle.append({
+            "repo": repo,
+            "first": first_d.isoformat(),
+            "last": last_d.isoformat(),
+            "span_days": (last_d.date() - first_d.date()).days,
+            "commits": len(ds),
+            "peak": f"{peak_m[0]}-{peak_m[1]:02d}",
+            "peak_count": peak_n,
+        })
+        for i in range(1, len(ds)):
+            gap = (ds[i].date() - ds[i - 1].date()).days
+            if gap >= 90:
+                resurrections.append({
+                    "repo": repo,
+                    "from": ds[i - 1].date().isoformat(),
+                    "to": ds[i].date().isoformat(),
+                    "days": gap,
+                })
+    resurrections.sort(key=lambda r: r["days"], reverse=True)
+    repo_lifecycle.sort(key=lambda r: r["span_days"], reverse=True)
+
+    # --- subject classifier: bin each commit subject into one category ---
+    cat_counts = collections.Counter()
+    cat_per_year = collections.defaultdict(lambda: collections.Counter())
+    conv_per_year = collections.defaultdict(lambda: [0, 0])  # [conv, total]
+    oops_count = 0
+    fixup_count = 0
+    revert_count = 0
+    pr_count_by_repo = collections.Counter()
+    pr_total = 0
+    subj_lengths = []
+    for c in commits:
+        subj = c[6].strip()
+        if not subj:
+            continue
+        subj_lengths.append(len(subj))
+        cat = "other"
+        for label, rx in SUBJECT_BINS:
+            if rx.search(subj):
+                cat = label
+                break
+        cat_counts[cat] += 1
+        cat_per_year[c[2].year][cat] += 1
+        conv_per_year[c[2].year][1] += 1
+        if CONV_RE.search(subj):
+            conv_per_year[c[2].year][0] += 1
+        if OOPS_RE.search(subj):
+            oops_count += 1
+        if FIXUP_RE.search(subj):
+            fixup_count += 1
+        if cat == "revert":
+            revert_count += 1
+        m = PR_MERGE_RE.search(subj)
+        if m:
+            pr_count_by_repo[c[0]] += 1
+            pr_total += 1
+
+    cat_year_keys = sorted(cat_per_year.keys())
+    cat_categories = [b[0] for b in SUBJECT_BINS] + ["other"]
+    cat_year_series = {
+        cat: [cat_per_year[y].get(cat, 0) for y in cat_year_keys]
+        for cat in cat_categories
+    }
+    conv_years = sorted(conv_per_year.keys())
+    conv_pct = [
+        round(100 * conv_per_year[y][0] / conv_per_year[y][1], 1) if conv_per_year[y][1] else 0
+        for y in conv_years
+    ]
+
+    # --- co-authors ---
+    coauthor_counter = collections.Counter()
+    coauthor_total = 0
+    for c in commits:
+        if not c[7]:
+            continue
+        for raw in c[7].split("\x1f"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            coauthor_counter[raw] += 1
+            coauthor_total += 1
+    top_coauthors = coauthor_counter.most_common(15)
+
+    # --- identity timeline: distinct (name, email) with first/last/count ---
+    identities = {}
+    for c in commits:
+        key = (c[4], c[3])  # (name, email)
+        first_seen, last_seen, count = identities.get(key, (c[2], c[2], 0))
+        if c[2] < first_seen:
+            first_seen = c[2]
+        if c[2] > last_seen:
+            last_seen = c[2]
+        identities[key] = (first_seen, last_seen, count + 1)
+    identity_rows = sorted(
+        [(n, e, fs.isoformat(), ls.isoformat(), ct) for (n, e), (fs, ls, ct) in identities.items()],
+        key=lambda r: r[2],
+    )
+
     # LOC
+    TEST_RE = re.compile(r"(^|/)(tests?|spec|specs|__tests__|e2e)/|(_test|_spec|\.test|\.spec)\.[a-z0-9]+$", re.I)
+    DOCS_RE = re.compile(r"\.(md|mdx|rst|txt|adoc|asciidoc)$", re.I)
+    CONFIG_RE = re.compile(r"\.(ya?ml|toml|ini|cfg|conf|json|xml|properties|env)$", re.I)
+
     commit_add_raw = collections.defaultdict(int)
     commit_del_raw = collections.defaultdict(int)
     commit_add = collections.defaultdict(int)
@@ -241,6 +738,13 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
     ext_add = collections.Counter()
     repo_add = collections.Counter()
     repo_del = collections.Counter()
+    file_touches = collections.Counter()
+    file_add = collections.Counter()
+    test_by_month = collections.defaultdict(lambda: [0, 0])  # [test_lines, code_lines]
+    docs_by_month = collections.defaultdict(int)
+    config_by_month = collections.defaultdict(int)
+    deepest_path = ""
+    deepest_depth = -1
 
     for repo, sha, iso, add, dele, path in loc_rows:
         commit_add_raw[sha] += add
@@ -258,6 +762,25 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
         ext_add[ext] += add
         repo_add[repo] += add
         repo_del[repo] += dele
+        # path-aware bins
+        clean_path = path.split(" => ", 1)[1] if " => " in path else path
+        depth = clean_path.count("/")
+        if depth > deepest_depth:
+            deepest_depth = depth
+            deepest_path = f"{repo}/{clean_path}"
+        file_touches[(repo, clean_path)] += 1
+        file_add[(repo, clean_path)] += add
+        meta = commit_meta.get(sha)
+        if meta:
+            ymo = (meta[2].year, meta[2].month)
+            if TEST_RE.search(clean_path):
+                test_by_month[ymo][0] += add
+            else:
+                test_by_month[ymo][1] += add
+            if DOCS_RE.search(clean_path):
+                docs_by_month[ymo] += add
+            if CONFIG_RE.search(clean_path):
+                config_by_month[ymo] += add
 
     total_add_raw = sum(commit_add_raw.values())
     total_del_raw = sum(commit_del_raw.values())
@@ -267,7 +790,7 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
     if commit_add:
         biggest_sha, biggest_add = max(commit_add.items(), key=lambda kv: kv[1])
         bm = commit_meta.get(biggest_sha, (None, None, None))
-        subj_by_sha = {c[1]: c[5] for c in commits}
+        subj_by_sha = {c[1]: c[6] for c in commits}
         biggest = {
             "sha": biggest_sha[:10],
             "add": biggest_add,
@@ -312,6 +835,86 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
     top_repos_loc = [(r, a, repo_del.get(r, 0)) for r, a in top_repos_loc_pairs]
     year_loc_items = sorted(loc_by_year.items())
 
+    # enrich peak month with LOC stats now that commit_add exists
+    if peak_month_data.get("ym") is not None:
+        ym = peak_month_data["ym"]
+        peak_sizes = []
+        peak_ext = collections.Counter()
+        for sha, add in commit_add.items():
+            meta = commit_meta.get(sha)
+            if not meta:
+                continue
+            d = meta[2]
+            if (d.year, d.month) == ym:
+                peak_sizes.append(add)
+        for repo, sha, iso, add, dele, path in loc_rows:
+            meta = commit_meta.get(sha)
+            if not meta:
+                continue
+            if (meta[2].year, meta[2].month) == ym and not NOISE_RE.search(path):
+                peak_ext[ext_of(path)] += add
+        peak_month_data["median_commit_size"] = int(statistics.median(peak_sizes)) if peak_sizes else 0
+        top_lang = peak_ext.most_common(1)
+        peak_month_data["top_language"] = top_lang[0][0] if top_lang else ""
+        peak_month_data["top_language_lines"] = top_lang[0][1] if top_lang else 0
+        peak_month_data.pop("ym", None)
+
+    # commit-size distribution (additions only, post-noise filter)
+    commit_sizes = list(commit_add.values())
+    size_buckets = [0, 0, 0, 0, 0, 0]  # 0, 1-10, 11-100, 101-500, 501-2000, 2000+
+    for s in commit_sizes:
+        if s == 0:
+            size_buckets[0] += 1
+        elif s <= 10:
+            size_buckets[1] += 1
+        elif s <= 100:
+            size_buckets[2] += 1
+        elif s <= 500:
+            size_buckets[3] += 1
+        elif s <= 2000:
+            size_buckets[4] += 1
+        else:
+            size_buckets[5] += 1
+    size_p50 = int(percentile(commit_sizes, 50))
+    size_p95 = int(percentile(commit_sizes, 95))
+    size_p99 = int(percentile(commit_sizes, 99))
+
+    # median commit size by year
+    sizes_per_year = collections.defaultdict(list)
+    for sha, add in commit_add.items():
+        meta = commit_meta.get(sha)
+        if meta:
+            sizes_per_year[meta[2].year].append(add)
+    median_size_per_year = {y: int(statistics.median(v)) for y, v in sizes_per_year.items() if v}
+
+    # test ratio per month
+    test_ratio_labels = sorted(test_by_month.keys())
+    test_ratio_values = [
+        round(100 * test_by_month[k][0] / (test_by_month[k][0] + test_by_month[k][1]), 1)
+        if (test_by_month[k][0] + test_by_month[k][1]) else 0
+        for k in test_ratio_labels
+    ]
+    test_ratio_label_strs = [f"{y}-{m:02d}" for y, m in test_ratio_labels]
+
+    # docs effort per month aligned to existing month axis
+    docs_month_series = [docs_by_month.get((y, m), 0) for y, m in mkeys]
+    config_month_series = [config_by_month.get((y, m), 0) for y, m in mkeys]
+    docs_month_labels = [f"{y}-{m:02d}" for y, m in mkeys]
+
+    # most-touched files (top 25)
+    top_files = file_touches.most_common(25)
+    top_files_rich = [
+        {"repo": r, "path": p, "touches": t, "add": file_add.get((r, p), 0)}
+        for (r, p), t in top_files
+    ]
+
+    # extension polyglot entropy (Shannon over commit-counts per ext, not LOC)
+    ext_commit_counts = collections.Counter()
+    for (_r, p), n in file_touches.items():
+        ext_commit_counts[ext_of(p)] += n
+    ext_entropy = round(shannon_entropy(ext_commit_counts), 3)
+    ext_distinct = len([e for e, n in ext_commit_counts.items() if n > 0])
+
     return {
         "title": title,
         "generated": dt.datetime.now().isoformat(timespec="seconds"),
@@ -339,6 +942,68 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
         "top_verbs": top_verbs,
         "merges": merges,
         "years": year_items,
+        "sessions": {
+            "count": len(sessions),
+            "median_min": round(statistics.median(session_minutes), 1) if session_minutes else 0,
+            "p95_min": round(percentile(session_minutes, 95), 1),
+            "median_commits": int(statistics.median(session_counts)) if session_counts else 0,
+            "p95_commits": int(percentile(session_counts, 95)),
+            "buckets": session_buckets,
+            "longest": {
+                "minutes": round((longest_session[1] - longest_session[0]).total_seconds() / 60, 1),
+                "commits": longest_session[2],
+                "start": longest_session[0].isoformat(),
+            },
+            "busiest": {
+                "minutes": round((busiest_session[1] - busiest_session[0]).total_seconds() / 60, 1),
+                "commits": busiest_session[2],
+                "start": busiest_session[0].isoformat(),
+            },
+        },
+        "burstiness": round(burstiness, 3),
+        "mean_inter_min": round(mu / 60, 1) if inter else 0,
+        "chronotype": {
+            "years": chrono_years,
+            "centroid_hour": chrono_centroid,
+            "first_commit_hour": chrono_first,
+            "weekend_pct": chrono_weekend,
+            "evening_pct": chrono_evening,
+            "night_pct": chrono_night,
+            "repo_entropy": chrono_repo_entropy,
+        },
+        "first_hour_dist": first_hour_dist,
+        "repo_entropy": {"labels": entropy_labels, "values": entropy_values},
+        "vacations": top_vacations,
+        "repo_gini": repo_gini_val,
+        "subject_categories": cat_categories,
+        "subject_cat_counts": [(c, cat_counts.get(c, 0)) for c in cat_categories],
+        "subject_cat_year": {"years": cat_year_keys, "series": cat_year_series},
+        "subject_len": {
+            "median": int(statistics.median(subj_lengths)) if subj_lengths else 0,
+            "p95": int(percentile(subj_lengths, 95)),
+            "max": max(subj_lengths) if subj_lengths else 0,
+        },
+        "conv_commits": {"years": conv_years, "pct": conv_pct},
+        "oops_count": oops_count,
+        "fixup_count": fixup_count,
+        "revert_count": revert_count,
+        "pr_total": pr_total,
+        "pr_top_repos": pr_count_by_repo.most_common(10),
+        "coauthor_total": coauthor_total,
+        "coauthor_distinct": len(coauthor_counter),
+        "top_coauthors": top_coauthors,
+        "identities": identity_rows,
+        "timezone": {
+            "labels": tz_labels,
+            "modal": tz_modal,
+            "distinct": tz_distinct,
+            "transitions": tz_transitions[:20],
+        },
+        "resurrections": resurrections[:25],
+        "repo_lifecycle": repo_lifecycle[:50],
+        "worst_week": worst_week,
+        "all_daily": all_daily,
+        "peak_month": peak_month_data,
         "loc": {
             "commits_with_data": len(commit_add_raw),
             "total_add_raw": total_add_raw,
@@ -355,6 +1020,19 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
             "top_ext": top_ext,
             "top_repos_loc": top_repos_loc,
             "by_year": [(y, v[0], v[1]) for y, v in year_loc_items],
+            "size_buckets": size_buckets,
+            "size_p50": size_p50,
+            "size_p95": size_p95,
+            "size_p99": size_p99,
+            "median_size_per_year": sorted(median_size_per_year.items()),
+            "test_ratio": {"labels": test_ratio_label_strs, "values": test_ratio_values},
+            "docs_month": {"labels": docs_month_labels, "docs": docs_month_series, "config": config_month_series},
+            "top_files": top_files_rich,
+            "deepest_path": deepest_path,
+            "deepest_depth": deepest_depth,
+            "ext_entropy": ext_entropy,
+            "ext_distinct": ext_distinct,
+            "survival": _build_survival(loc_by_year, survival or {}),
         },
     }
 
@@ -391,6 +1069,20 @@ td:last-child { text-align:right; color:var(--accent); font-variant-numeric:tabu
 .pill { display:inline-block; padding:3px 10px; border-radius:999px; background:#1a2432; color:var(--accent); font-size:12px; margin-right:6px }
 footer { padding:20px 40px 40px; color:var(--dim); font-size:12px; text-align:center }
 .hint { color:var(--dim); font-size:11px; margin-top:8px }
+.traj { display:flex; flex-direction:column; gap:6px }
+.traj-row { display:flex; align-items:center; gap:14px }
+.traj-lbl { width:170px; color:var(--dim); font-size:12px; text-align:right; font-variant-numeric:tabular-nums }
+.traj-val { width:170px; color:var(--accent); font-size:12px; text-align:right; font-variant-numeric:tabular-nums }
+.traj-delta-up { color:var(--cool) } .traj-delta-down { color:var(--hot) } .traj-delta-flat { color:var(--dim) }
+.traj-chart-wrap { flex:1; height:36px; position:relative }
+.cal { display:flex; flex-direction:column; gap:8px }
+.cal-row { display:flex; align-items:center; gap:8px }
+.cal-yr-lbl { width:42px; color:var(--dim); font-size:12px; text-align:right; font-variant-numeric:tabular-nums }
+.cal-grid { display:grid; grid-template-columns: repeat(53, 11px); grid-auto-rows:11px; gap:2px }
+.cal-cell { width:11px; height:11px; border-radius:2px; background:#1a2432 }
+.long-table tr td:first-child { white-space:normal; word-break:break-all }
+td.num { text-align:right; color:var(--accent); font-variant-numeric:tabular-nums }
+td.dim { color:var(--dim); font-size:12px }
 </style></head><body>
 <header><h1 id="hdr-title"></h1><div class="sub"><span id="hdr-scan"></span> - <span id="hdr-sub"></span></div></header>
 
@@ -447,6 +1139,111 @@ footer { padding:20px 40px 40px; color:var(--dim); font-size:12px; text-align:ce
 
   <div class="card span-12"><h2>Lines added / removed per year</h2><canvas id="chart-locyear" style="max-height:200px"></canvas></div>
 </div>
+
+<div class="section-hd">Sessions and rhythm</div>
+<div class="grid">
+  <div class="card span-3"><h2>Total sessions</h2><div class="stat" id="ses-n"></div><div class="stat-sub" id="ses-sub"></div></div>
+  <div class="card span-3"><h2>Median session length</h2><div class="stat" id="ses-med"></div><div class="stat-sub" id="ses-medc"></div></div>
+  <div class="card span-3"><h2>Longest single session</h2><div class="stat" id="ses-long"></div><div class="stat-sub" id="ses-long-sub"></div></div>
+  <div class="card span-3"><h2>Burstiness</h2><div class="stat" id="burst-b"></div><div class="stat-sub" id="burst-sub"></div></div>
+
+  <div class="card span-6"><h2>Session length distribution</h2><canvas id="chart-sesbuckets"></canvas>
+    <div class="hint" id="sesbuckets-hint">Buckets: under 30 min, 30-60 min, 1-2 h, 2-4 h, over 4 h.</div></div>
+  <div class="card span-6"><h2>Repo concurrency entropy (per month)</h2><canvas id="chart-entropy"></canvas>
+    <div class="hint" id="entropy-hint"></div></div>
+
+  <div class="card span-6"><h2>First commit of day (hour distribution)</h2><canvas id="chart-firsthour"></canvas>
+    <div class="hint" id="firsthour-hint"></div></div>
+  <div class="card span-6"><h2>Vacations / outages (gap of 7+ days)</h2><table id="t-vacations"></table>
+    <div class="hint" id="vac-hint"></div></div>
+</div>
+
+<div class="section-hd">Trajectory (year by year)</div>
+<div class="grid">
+  <div class="card span-12">
+    <h2>How you've changed</h2>
+    <div class="traj" id="traj"></div>
+    <div class="hint">Each row is a sparkline across years. Numbers on the right are the most recent year.</div>
+  </div>
+</div>
+
+<div class="section-hd">Subjects</div>
+<div class="grid">
+  <div class="card span-3"><h2>Conventional commits</h2><div class="stat" id="conv-pct"></div><div class="stat-sub" id="conv-sub"></div></div>
+  <div class="card span-3"><h2>Oops / typo / hack</h2><div class="stat" id="oops-n"></div><div class="stat-sub" id="oops-sub"></div></div>
+  <div class="card span-3"><h2>Reverts and fixups</h2><div class="stat" id="fix-n"></div><div class="stat-sub" id="fix-sub"></div></div>
+  <div class="card span-3"><h2>PR merges</h2><div class="stat" id="pr-n"></div><div class="stat-sub" id="pr-sub"></div></div>
+
+  <div class="card span-12"><h2>Subject categories per year</h2><canvas id="chart-cats" style="max-height:320px"></canvas>
+    <div class="hint" id="cats-hint"></div></div>
+  <div class="card span-6"><h2>Conventional-commits adoption</h2><canvas id="chart-conv"></canvas>
+    <div class="hint" id="conv-hint"></div></div>
+  <div class="card span-6"><h2>Top co-authors</h2><table id="t-coauthors"></table>
+    <div class="hint" id="coauthor-hint"></div></div>
+</div>
+
+<div class="section-hd">Code patterns</div>
+<div class="grid">
+  <div class="card span-3"><h2>Median commit</h2><div class="stat" id="size-med"></div><div class="stat-sub" id="size-pct-sub"></div></div>
+  <div class="card span-3"><h2>p95 commit</h2><div class="stat" id="size-p95"></div><div class="stat-sub" id="size-p95-sub"></div></div>
+  <div class="card span-3"><h2>Language spread</h2><div class="stat" id="ext-ent"></div><div class="stat-sub" id="ext-sub"></div></div>
+  <div class="card span-3"><h2>Repo Gini</h2><div class="stat" id="gini-n"></div><div class="stat-sub" id="gini-sub"></div></div>
+
+  <div class="card span-6"><h2>Commit-size distribution (lines added)</h2><canvas id="chart-sizes"></canvas>
+    <div class="hint" id="sizes-hint"></div></div>
+  <div class="card span-6"><h2>Test ratio per month</h2><canvas id="chart-testratio"></canvas>
+    <div class="hint" id="testratio-hint"></div></div>
+
+  <div class="card span-6 long-table"><h2>Most-touched files (top 25)</h2><table id="t-files"></table>
+    <div class="hint" id="files-hint"></div></div>
+  <div class="card span-6"><h2>Docs and config volume per month</h2><canvas id="chart-docs"></canvas>
+    <div class="hint" id="docs-hint"></div></div>
+
+  <div class="card span-12"><h2>Deepest path you've written into</h2>
+    <div class="hint" id="deepest-path-text"></div></div>
+</div>
+
+<div class="section-hd" id="hd-survival" style="display:none">Code survival</div>
+<div class="grid" id="grid-survival" style="display:none">
+  <div class="card span-3"><h2>Lines alive in HEAD</h2><div class="stat add" id="surv-alive"></div><div class="stat-sub" id="surv-alive-sub"></div></div>
+  <div class="card span-3"><h2>Overall survival</h2><div class="stat" id="surv-pct"></div><div class="stat-sub">of all lines you've ever added</div></div>
+  <div class="card span-6"><h2>Years on file</h2><div class="stat" id="surv-years"></div><div class="stat-sub">distinct author-years still alive in HEAD</div></div>
+  <div class="card span-12"><h2>Lines you wrote in year X, still in HEAD</h2><canvas id="chart-survival" style="max-height:280px"></canvas></div>
+</div>
+
+<div class="section-hd">Identity and timezone</div>
+<div class="grid">
+  <div class="card span-6"><h2>Identities used</h2><table id="t-identities"></table>
+    <div class="hint" id="identity-hint"></div></div>
+  <div class="card span-6"><h2>Timezone (modal UTC offset per month)</h2><canvas id="chart-tz"></canvas>
+    <div class="hint" id="tz-hint"></div></div>
+</div>
+
+<div class="section-hd">Repo lifecycle</div>
+<div class="grid">
+  <div class="card span-12 long-table"><h2>Per-repo lifecycle (top 50 by span)</h2><table id="t-lifecycle"></table>
+    <div class="hint" id="lifecycle-hint"></div></div>
+  <div class="card span-12 long-table"><h2>Cold-repo resurrections (gap of 90+ days)</h2><table id="t-resur"></table>
+    <div class="hint" id="resur-hint"></div></div>
+</div>
+
+<div class="section-hd">Headlines</div>
+<div class="grid">
+  <div class="card span-6"><h2>Most intense week</h2>
+    <div class="callout"><div class="big" id="ww-n"></div><div class="txt" id="ww-t"></div></div>
+    <canvas id="chart-ww-hours" style="max-height:160px;margin-top:8px"></canvas>
+    <div class="hint">When during the day those commits landed. A spike at one hour usually means scripted work; a spread means real interactive sessions.</div></div>
+  <div class="card span-6"><h2>Peak month, broken down</h2>
+    <div class="callout"><div class="big" id="pm-n"></div><div class="txt" id="pm-t"></div></div>
+    <div class="hint" id="pm-extra"></div></div>
+</div>
+
+<div class="section-hd">Calendar</div>
+<div class="grid">
+  <div class="card span-12"><h2>Multi-year heatmap</h2><div class="cal" id="cal"></div>
+    <div class="hint">Each column is one ISO week, each row is one weekday (Mon top to Sun bottom). Cells get darker with more commits.</div></div>
+</div>
+
 <footer>generated <span id="f-ts"></span> by gitdna</footer>
 
 <script>
@@ -532,6 +1329,435 @@ new Chart(document.getElementById("chart-locyear"), { type:"bar", data:{ labels:
     }
   }
 }
+
+// --- sessions ---
+{
+  const S = D.sessions;
+  const perActive = D.active_days ? (S.count/D.active_days).toFixed(2) : "0";
+  document.getElementById("ses-n").textContent = fmt(S.count);
+  document.getElementById("ses-sub").textContent = perActive + " sessions per active day; mean gap " + D.mean_inter_min + " min between commits";
+  document.getElementById("ses-med").textContent = S.median_min + " min";
+  document.getElementById("ses-medc").textContent = "your typical coding window. Inside it, median " + S.median_commits + " commits, p95 " + S.p95_commits;
+  const longHrs = (S.longest.minutes/60).toFixed(1);
+  const longMult = S.median_min > 0 ? (S.longest.minutes/S.median_min).toFixed(0) : "-";
+  document.getElementById("ses-long").textContent = longHrs + " h";
+  document.getElementById("ses-long-sub").textContent = S.longest.commits + " commits, " + longMult + "x your median, started " + S.longest.start.replace("T"," ").slice(0,16);
+  const b = D.burstiness;
+  let blabel;
+  if (b < 0)        blabel = "more regular than random";
+  else if (b < 0.3) blabel = "mostly regular";
+  else if (b < 0.6) blabel = "bursty";
+  else if (b < 0.8) blabel = "very bursty";
+  else              blabel = "extremely bursty";
+  document.getElementById("burst-b").textContent = b.toFixed(2);
+  document.getElementById("burst-sub").textContent = blabel + ". -1 = clockwork, 0 = random Poisson, 1 = all activity in tight clusters.";
+  // session buckets and chart hint
+  const totalSes = S.buckets.reduce((a,c)=>a+c,0);
+  const bp = i => totalSes ? Math.round(100*S.buckets[i]/totalSes) : 0;
+  document.getElementById("sesbuckets-hint").textContent =
+    bp(0)+"% under 30 min, "+bp(1)+"% 30-60m, "+bp(2)+"% 1-2h, "+bp(3)+"% 2-4h, "+bp(4)+"% 4h+. Most short sessions = lots of quick check-ins; thick tail = real deep-work blocks.";
+  new Chart(document.getElementById("chart-sesbuckets"), { type:"bar", data:{ labels:["<30m","30-60m","1-2h","2-4h",">4h"], datasets:[{ data:S.buckets, backgroundColor:"#7cc4ff", borderRadius:4 }]}, options: opt() });
+}
+
+// --- repo concurrency entropy ---
+{
+  const E = D.repo_entropy;
+  const meanEnt = E.values.length ? (E.values.reduce((a,b)=>a+b,0)/E.values.length) : 0;
+  const maxEnt  = D.repos_count > 1 ? Math.log2(D.repos_count) : 0;
+  document.getElementById("entropy-hint").textContent =
+    "Average across all months: " + meanEnt.toFixed(2) +
+    " (theoretical max " + maxEnt.toFixed(2) + " across " + D.repos_count + " repos). " +
+    "0 = single-repo focus that month; higher = spread across many.";
+  new Chart(document.getElementById("chart-entropy"), { type:"line", data:{ labels:E.labels, datasets:[{ data:E.values, borderColor:"#ffb36b", backgroundColor:"rgba(255,179,107,0.18)", fill:true, tension:0.25, pointRadius:0 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}}, x:{grid:{display:false}, ticks:{maxTicksLimit:18}}} }});
+}
+
+// --- first-hour-of-day distribution ---
+{
+  let totalDays = D.first_hour_dist.reduce((a,b)=>a+b,0);
+  let medianHr = 0, acc = 0;
+  for (let h=0; h<24; h++) { acc += D.first_hour_dist[h]; if (totalDays && acc >= totalDays/2) { medianHr = h; break; } }
+  document.getElementById("firsthour-hint").textContent =
+    "When your workday actually starts. Median first-commit hour: " + medianHr + "h on " + fmt(totalDays) + " active days.";
+  new Chart(document.getElementById("chart-firsthour"), { type:"bar", data:{ labels:[...Array(24).keys()].map(h=>h+"h"), datasets:[{ data:D.first_hour_dist, backgroundColor:"#5ae0a3", borderRadius:4 }]}, options: opt() });
+}
+
+// --- vacations ---
+{
+  const t = document.getElementById("t-vacations");
+  const hint = document.getElementById("vac-hint");
+  if (!D.vacations.length) {
+    const tr=document.createElement("tr"); tr.innerHTML='<td class="dim">No gaps of 7 or more days.</td>'; t.appendChild(tr);
+    hint.textContent = "You committed at least once every 6 days for the entire span.";
+  } else {
+    D.vacations.forEach(([from,to,days]) => {
+      const tr=document.createElement("tr"); tr.innerHTML=`<td>${from} -> ${to}</td><td class="num">${days}d</td>`; t.appendChild(tr);
+    });
+    const totalOff = D.vacations.reduce((a,v)=>a+v[2],0);
+    const longest = D.vacations[0][2];
+    const pctOff = D.span_days ? Math.round(100*totalOff/D.span_days) : 0;
+    hint.textContent = D.vacations.length + " gaps; longest " + longest + " days; total time off " + totalOff + " days (" + pctOff + "% of your span).";
+  }
+}
+
+// --- trajectory sparklines ---
+{
+  const C = D.chronotype;
+  const ms = D.loc.median_size_per_year;
+  const sizeYears = ms.map(x=>x[0]);
+  const sizeVals = ms.map(x=>x[1]);
+  const rows = [
+    { label:"centroid commit hour",  years:C.years, data:C.centroid_hour,    fmt:v=>v.toFixed(1)+"h",  color:"#7cc4ff", higher:"later" },
+    { label:"first commit hour",     years:C.years, data:C.first_commit_hour,fmt:v=>v.toFixed(1)+"h",  color:"#7cc4ff", higher:"later" },
+    { label:"night share (0-7h)",    years:C.years, data:C.night_pct,        fmt:v=>v.toFixed(1)+"%",  color:"#b88dff", higher:"more"  },
+    { label:"evening share (18-24h)",years:C.years, data:C.evening_pct,      fmt:v=>v.toFixed(1)+"%",  color:"#ffb36b", higher:"more"  },
+    { label:"weekend share",         years:C.years, data:C.weekend_pct,      fmt:v=>v.toFixed(1)+"%",  color:"#ff6b6b", higher:"more"  },
+    { label:"repo entropy (mean)",   years:C.years, data:C.repo_entropy,     fmt:v=>v.toFixed(2),      color:"#5ae0a3", higher:"scattered" },
+    { label:"median commit size",    years:sizeYears,data:sizeVals,          fmt:v=>fmt(v)+" ln",      color:"#5ae0a3", higher:"bigger" },
+  ];
+  const traj = document.getElementById("traj");
+  rows.forEach((r, i) => {
+    const row = document.createElement("div"); row.className="traj-row";
+    const lbl = document.createElement("div"); lbl.className="traj-lbl"; lbl.textContent = r.label;
+    const wrap = document.createElement("div"); wrap.className="traj-chart-wrap";
+    const cv = document.createElement("canvas"); cv.id = "traj-cv-" + i; wrap.appendChild(cv);
+    const val = document.createElement("div"); val.className="traj-val";
+    if (r.data.length >= 2) {
+      const a = r.data[0], b = r.data[r.data.length-1];
+      const cls = b > a ? "traj-delta-up" : b < a ? "traj-delta-down" : "traj-delta-flat";
+      const arrow = b > a ? " /\\ " : b < a ? " \\/ " : " -- ";
+      val.innerHTML = r.fmt(a) + '<span class="' + cls + '">' + arrow + '</span>' + r.fmt(b);
+    } else if (r.data.length === 1) {
+      val.textContent = r.fmt(r.data[0]);
+    } else {
+      val.textContent = "-";
+    }
+    row.appendChild(lbl); row.appendChild(wrap); row.appendChild(val); traj.appendChild(row);
+    new Chart(cv, { type:"line", data:{ labels:r.years, datasets:[{ data:r.data, borderColor:r.color, backgroundColor:r.color+"33", fill:true, tension:0.3, pointRadius:r.data.length<=12?2:0 }]}, options:{ responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{y:{display:false}, x:{display:false}} }});
+  });
+}
+
+// --- subjects ---
+{
+  const conv = D.conv_commits;
+  const lastConv = conv.pct.length ? conv.pct[conv.pct.length-1] : 0;
+  const firstConv = conv.pct.length ? conv.pct[0] : 0;
+  const lastYear = conv.years.length ? conv.years[conv.years.length-1] : "n/a";
+  const firstYear = conv.years.length ? conv.years[0] : "n/a";
+  document.getElementById("conv-pct").textContent = lastConv + "%";
+  document.getElementById("conv-sub").textContent =
+    conv.years.length > 1
+      ? "in " + lastYear + ", up from " + firstConv + "% in " + firstYear
+      : "in " + lastYear;
+
+  const oopsPct = D.total ? (100*D.oops_count/D.total).toFixed(2) : 0;
+  document.getElementById("oops-n").textContent = fmt(D.oops_count);
+  document.getElementById("oops-sub").textContent =
+    oopsPct + "% of " + fmt(D.total) + " commits use words like oops/typo/hack/finally/sigh.";
+
+  const fixTotal = D.revert_count + D.fixup_count;
+  const fixPct = D.total ? (100*fixTotal/D.total).toFixed(2) : 0;
+  document.getElementById("fix-n").textContent = fmt(fixTotal);
+  document.getElementById("fix-sub").textContent =
+    D.revert_count + " reverts + " + D.fixup_count + " fixups, " + fixPct + "% of all commits";
+
+  document.getElementById("pr-n").textContent = fmt(D.pr_total);
+  if (D.pr_total) {
+    const mergePctNum = D.merges ? 100*D.pr_total/D.merges : 0;
+    const mergePctStr = mergePctNum >= 1 ? mergePctNum.toFixed(0) + "%" : mergePctNum > 0 ? "<1%" : "0%";
+    const repoCount = D.pr_top_repos.length;
+    document.getElementById("pr-sub").textContent =
+      mergePctStr + " of your " + fmt(D.merges) + " merge commits are PR merges (the rest are 'Merge branch'). Top repo: " + D.pr_top_repos[0][0] + " (" + D.pr_top_repos[0][1] + ").";
+  } else {
+    document.getElementById("pr-sub").textContent = "No 'Merge pull request' commits found.";
+  }
+
+  // categories chart with overall summary
+  const cats = D.subject_cat_year;
+  const palette = ["#5ae0a3","#ff6b6b","#7cc4ff","#ffb36b","#b88dff","#dde47a","#6ee0ff","#ff8db5","#9ad79a","#aaaaaa"];
+  const datasets = D.subject_categories.map((cat, i) => ({ label:cat, data:cats.series[cat], backgroundColor:palette[i%palette.length], stack:"s" }));
+  new Chart(document.getElementById("chart-cats"), { type:"bar", data:{ labels:cats.years, datasets }, options:{ plugins:{legend:{labels:{color:"#8ea2bd"}}}, scales:{y:{grid:{color:"#1f2a39"}, stacked:true}, x:{grid:{display:false}, stacked:true}} }});
+  // dominant overall category (excluding 'merge' since that's already a separate top-level stat)
+  const cats_pairs = D.subject_cat_counts.filter(([n])=>n!=="merge"&&n!=="other");
+  cats_pairs.sort((a,b)=>b[1]-a[1]);
+  const otherEntry = D.subject_cat_counts.find(([n])=>n==="other");
+  const otherCount = otherEntry ? otherEntry[1] : 0;
+  const otherPct = D.total ? Math.round(100*otherCount/D.total) : 0;
+  const top1 = cats_pairs[0] ? cats_pairs[0] : null;
+  const top1Pct = top1 && D.total ? Math.round(100*top1[1]/D.total) : 0;
+  document.getElementById("cats-hint").textContent =
+    (top1 ? "Most common labelled category: " + top1[0] + " (" + fmt(top1[1]) + ", " + top1Pct + "%). " : "") +
+    otherPct + "% of subjects don't start with any conventional prefix.";
+
+  // conv adoption chart with crossing-point hint
+  new Chart(document.getElementById("chart-conv"), { type:"line", data:{ labels:conv.years, datasets:[{ data:conv.pct, borderColor:"#7cc4ff", backgroundColor:"rgba(124,196,255,0.18)", fill:true, tension:0.25, pointRadius:3 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}, suggestedMax:100, ticks:{callback:v=>v+"%"}}, x:{grid:{display:false}}} }});
+  let firstNonZero = -1;
+  for (let i = 0; i < conv.pct.length; i++) if (conv.pct[i] > 0) { firstNonZero = i; break; }
+  let firstAbove10 = -1;
+  for (let i = 0; i < conv.pct.length; i++) if (conv.pct[i] >= 10) { firstAbove10 = i; break; }
+  document.getElementById("conv-hint").textContent =
+    "% of subjects matching feat/fix/chore/refactor/docs/style/test/perf/build/ci/revert(scope)?: format. " +
+    (firstNonZero >= 0 ? "First measurable adoption: " + conv.years[firstNonZero] + " (" + conv.pct[firstNonZero] + "%). " : "Never adopted. ") +
+    (firstAbove10 >= 0 ? "Crossed 10% in " + conv.years[firstAbove10] + "." : "Never crossed 10%.");
+
+  const tco = document.getElementById("t-coauthors");
+  if (!D.top_coauthors.length) {
+    const tr=document.createElement("tr"); tr.innerHTML='<td class="dim">No co-authored-by trailers.</td>'; tco.appendChild(tr);
+    document.getElementById("coauthor-hint").textContent = "No commit body has a Co-authored-by trailer.";
+  } else {
+    D.top_coauthors.forEach(([name,n]) => {
+      const tr=document.createElement("tr"); tr.innerHTML=`<td>${name}</td><td class="num">${fmt(n)}</td>`; tco.appendChild(tr);
+    });
+    const topShare = D.coauthor_total ? Math.round(100*D.top_coauthors[0][1]/D.coauthor_total) : 0;
+    const coPct = D.total ? (100*D.coauthor_total/D.total).toFixed(1) : 0;
+    document.getElementById("coauthor-hint").textContent =
+      D.coauthor_total + " mentions across " + D.coauthor_distinct + " distinct people. " +
+      "Top one was " + topShare + "% of co-author lines. " +
+      coPct + "% of your commits cite a co-author.";
+  }
+}
+
+// --- code patterns ---
+{
+  const L = D.loc;
+  // headline cards
+  document.getElementById("size-med").textContent = fmt(L.size_p50);
+  document.getElementById("size-pct-sub").textContent = "lines added. Half your commits are smaller. Top 1% are >= " + fmt(L.size_p99) + " lines.";
+  document.getElementById("size-p95").textContent = fmt(L.size_p95);
+  document.getElementById("size-p95-sub").textContent = "95% of commits add fewer. " + (L.size_p95 > 500 ? "Big drops happen often." : "You commit in small chunks.");
+
+  const maxEnt = L.ext_distinct > 1 ? Math.log2(L.ext_distinct) : 1;
+  const evenness = maxEnt ? Math.round(100*L.ext_entropy/maxEnt) : 0;
+  document.getElementById("ext-ent").textContent = evenness + "%";
+  document.getElementById("ext-sub").textContent = "of perfect evenness across " + L.ext_distinct + " extensions. Higher = many languages share the load; lower = one extension dominates.";
+
+  const topRepoShare = D.top_repos[0] && D.total ? Math.round(100*D.top_repos[0][1]/D.total) : 0;
+  document.getElementById("gini-n").textContent = D.repo_gini.toFixed(2);
+  document.getElementById("gini-sub").textContent = "Top repo took " + topRepoShare + "% of all commits. 0 = even spread, 1 = one repo gets everything.";
+
+  // commit-size distribution chart with summary hint
+  const totalCS = L.size_buckets.reduce((a,b)=>a+b,0);
+  const sb = i => totalCS ? Math.round(100*L.size_buckets[i]/totalCS) : 0;
+  document.getElementById("sizes-hint").textContent =
+    sb(0)+"% empty, "+sb(1)+"% 1-10 lines, "+sb(2)+"% 11-100, "+sb(3)+"% 101-500, "+sb(4)+"% 501-2k, "+sb(5)+"% 2k+. " +
+    "A long right tail usually means initial dumps or vendored code; mostly 1-100 means you commit incrementally.";
+  new Chart(document.getElementById("chart-sizes"), { type:"bar", data:{ labels:["0","1-10","11-100","101-500","501-2k","2k+"], datasets:[{ data:L.size_buckets, backgroundColor:"#7cc4ff", borderRadius:4 }]}, options: opt() });
+
+  // test ratio chart with overall mean
+  const tvals = L.test_ratio.values;
+  const meanTest = tvals.length ? (tvals.reduce((a,b)=>a+b,0)/tvals.length).toFixed(1) : "0";
+  const monthsWithTests = tvals.filter(v=>v>0).length;
+  document.getElementById("testratio-hint").textContent =
+    "Share of LOC added under test/spec paths. Lifetime average: " + meanTest + "%. " +
+    monthsWithTests + " of " + tvals.length + " months had any test code added.";
+  new Chart(document.getElementById("chart-testratio"), { type:"line", data:{ labels:L.test_ratio.labels, datasets:[{ data:tvals, borderColor:"#5ae0a3", backgroundColor:"rgba(90,224,163,0.18)", fill:true, tension:0.25, pointRadius:0 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}, ticks:{callback:v=>v+"%"}}, x:{grid:{display:false}, ticks:{maxTicksLimit:18}}} }});
+
+  // docs / config chart with totals hint
+  const totalDocs = L.docs_month.docs.reduce((a,b)=>a+b,0);
+  const totalCfg  = L.docs_month.config.reduce((a,b)=>a+b,0);
+  document.getElementById("docs-hint").textContent =
+    "Lifetime: +" + fmt(totalDocs) + " docs lines, +" + fmt(totalCfg) + " config lines.";
+  new Chart(document.getElementById("chart-docs"), { type:"line", data:{ labels:L.docs_month.labels, datasets:[
+    { label:"docs", data:L.docs_month.docs, borderColor:"#7cc4ff", backgroundColor:"rgba(124,196,255,0.15)", fill:true, tension:0.25, pointRadius:0 },
+    { label:"config", data:L.docs_month.config, borderColor:"#ffb36b", backgroundColor:"rgba(255,179,107,0.15)", fill:true, tension:0.25, pointRadius:0 }
+  ]}, options:{ plugins:{legend:{labels:{color:"#8ea2bd"}}}, scales:{y:{grid:{color:"#1f2a39"}, ticks:{callback:v=>v.toLocaleString()}}, x:{grid:{display:false}, ticks:{maxTicksLimit:18}}} }});
+
+  // most-touched files
+  const tf = document.getElementById("t-files");
+  L.top_files.forEach(f => {
+    const tr=document.createElement("tr"); tr.innerHTML=`<td>${f.repo} / ${f.path}</td><td class="num">${f.touches}x / +${fmt(f.add)}</td>`; tf.appendChild(tr);
+  });
+  if (L.top_files.length) {
+    const top = L.top_files[0];
+    const med = L.top_files[Math.floor(L.top_files.length/2)];
+    document.getElementById("files-hint").textContent =
+      "Top file got " + top.touches + "x; median in this top-25 is " + med.touches + "x. Files at the top are usually entry points, configs, or things you can't stop tweaking.";
+  }
+  document.getElementById("deepest-path-text").textContent = L.deepest_path ? "depth " + L.deepest_depth + ": " + L.deepest_path : "all paths shallow";
+}
+
+// --- code survival (only if --blame produced data) ---
+if (D.loc.survival && D.loc.survival.enabled) {
+  const S = D.loc.survival;
+  document.getElementById("hd-survival").style.display = "";
+  document.getElementById("grid-survival").style.display = "";
+  document.getElementById("surv-alive").textContent = "+" + fmt(S.total_alive);
+  document.getElementById("surv-alive-sub").textContent = "of +" + fmt(S.total_added) + " ever added";
+  document.getElementById("surv-pct").textContent = S.overall_pct + "%";
+  document.getElementById("surv-years").textContent = S.years.filter((y,i)=>S.alive[i]>0).length;
+  new Chart(document.getElementById("chart-survival"), { type:"bar", data:{ labels:S.years, datasets:[
+    { label:"added that year", data:S.added, backgroundColor:"rgba(124,196,255,0.45)" },
+    { label:"alive in HEAD",   data:S.alive, backgroundColor:"#5ae0a3" }
+  ]}, options:{ plugins:{legend:{labels:{color:"#8ea2bd"}}}, scales:{y:{grid:{color:"#1f2a39"}, ticks:{callback:v=>v.toLocaleString()}}, x:{grid:{display:false}}} }});
+}
+
+// --- identities ---
+{
+  const t = document.getElementById("t-identities");
+  D.identities.forEach(([name, email, fs, ls, ct]) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${name}<br><span class="dim">${email}</span></td><td class="num">${fs.slice(0,10)} -> ${ls.slice(0,10)}<br><span class="dim">${fmt(ct)} commits</span></td>`;
+    t.appendChild(tr);
+  });
+  if (D.identities.length) {
+    const totalCommits = D.identities.reduce((a,r)=>a+r[4],0);
+    const top = D.identities.slice().sort((a,b)=>b[4]-a[4])[0];
+    const topPct = totalCommits ? Math.round(100*top[4]/totalCommits) : 0;
+    const oldest = D.identities.slice().sort((a,b)=>a[2]<b[2]?-1:1)[0];
+    document.getElementById("identity-hint").textContent =
+      D.identities.length + " distinct (name, email) pairs. Most-used: " +
+      top[0] + " <" + top[1] + "> (" + topPct + "% of commits). " +
+      "Earliest: " + oldest[0] + " from " + oldest[2].slice(0,10) + ".";
+  }
+}
+
+// --- timezone ---
+{
+  const tz = D.timezone;
+  new Chart(document.getElementById("chart-tz"), { type:"line", data:{ labels:tz.labels, datasets:[{ data:tz.modal, borderColor:"#ffb36b", backgroundColor:"rgba(255,179,107,0.15)", fill:false, stepped:true, pointRadius:0 }]}, options:{ plugins:{legend:{display:false}}, scales:{y:{grid:{color:"#1f2a39"}, ticks:{callback:v=>(v>=0?"+":"")+v+"h"}}, x:{grid:{display:false}, ticks:{maxTicksLimit:18}}} }});
+  // share of months for each offset
+  const offsetShare = {};
+  for (const off of tz.modal) offsetShare[off] = (offsetShare[off]||0) + 1;
+  let dominantOff = null, dominantN = 0;
+  for (const k in offsetShare) if (offsetShare[k] > dominantN) { dominantN = offsetShare[k]; dominantOff = parseFloat(k); }
+  const totalMonths = tz.modal.length;
+  const dPct = totalMonths ? Math.round(100*dominantN/totalMonths) : 0;
+  const fmtOff = h => (h>=0?"+":"") + h + "h";
+  if (totalMonths === 0) {
+    document.getElementById("tz-hint").textContent = "No timezone data.";
+  } else if (tz.distinct.length === 1) {
+    document.getElementById("tz-hint").textContent =
+      "Single offset throughout: " + fmtOff(tz.distinct[0]) + ". You haven't moved.";
+  } else {
+    const distinctStr = tz.distinct.map(fmtOff).join(", ");
+    const story =
+      tz.transitions.length === 0
+        ? "but the modal offset every month was " + fmtOff(dominantOff) + ", so those other offsets show up as occasional commits, not a base relocation. Probably travel."
+        : "modal offset flipped " + tz.transitions.length + " times. Likely relocation(s).";
+    document.getElementById("tz-hint").textContent =
+      tz.distinct.length + " offsets ever appeared in your commits (" + distinctStr + "); " + story;
+  }
+}
+
+// --- repo lifecycle ---
+{
+  const t = document.getElementById("t-lifecycle");
+  D.repo_lifecycle.forEach(r => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${r.repo}</td><td class="num">${r.first.slice(0,10)} -> ${r.last.slice(0,10)}<br><span class="dim">${r.span_days}d, ${fmt(r.commits)} commits, peak ${r.peak} (${r.peak_count})</span></td>`;
+    t.appendChild(tr);
+  });
+  if (D.repo_lifecycle.length) {
+    const longestSpan = D.repo_lifecycle[0]; // already sorted by span_days desc
+    const mostCommits = D.repo_lifecycle.slice().sort((a,b)=>b.commits-a.commits)[0];
+    const oldest = D.repo_lifecycle.slice().sort((a,b)=>a.first<b.first?-1:1)[0];
+    const newest = D.repo_lifecycle.slice().sort((a,b)=>a.first>b.first?-1:1)[0];
+    document.getElementById("lifecycle-hint").textContent =
+      D.repos_count + " repos with activity. " +
+      "Longest-lived: " + longestSpan.repo + " (" + longestSpan.span_days + "d span). " +
+      "Most commits: " + mostCommits.repo + " (" + fmt(mostCommits.commits) + "). " +
+      "Oldest start: " + oldest.repo + " (" + oldest.first.slice(0,10) + "). " +
+      "Newest start: " + newest.repo + " (" + newest.first.slice(0,10) + ").";
+  }
+}
+
+// --- resurrections ---
+{
+  const t = document.getElementById("t-resur");
+  const hint = document.getElementById("resur-hint");
+  if (!D.resurrections.length) {
+    const tr=document.createElement("tr"); tr.innerHTML='<td class="dim">No resurrections.</td>'; t.appendChild(tr);
+    hint.textContent = "No repo went 90+ days without a commit and then came back.";
+  } else {
+    D.resurrections.forEach(r => {
+      const tr=document.createElement("tr"); tr.innerHTML=`<td>${r.repo}</td><td class="num">${r.from} -> ${r.to}<br><span class="dim">${r.days}d gap</span></td>`; t.appendChild(tr);
+    });
+    const longest = D.resurrections[0]; // sorted by days desc
+    const repoCount = {};
+    for (const r of D.resurrections) repoCount[r.repo] = (repoCount[r.repo]||0) + 1;
+    let mostRevived = null, mostN = 0;
+    for (const k in repoCount) if (repoCount[k] > mostN) { mostN = repoCount[k]; mostRevived = k; }
+    hint.textContent =
+      D.resurrections.length + " resurrections (gaps of 90+ days). " +
+      "Longest: " + longest.days + "d in " + longest.repo + ". " +
+      (mostN > 1 ? "Most-resurrected repo: " + mostRevived + " (" + mostN + " comebacks)." : "");
+  }
+}
+
+// --- most intense week ---
+{
+  const W = D.worst_week;
+  const weeklyAvg = D.span_days ? D.total / (D.span_days/7) : 0;
+  const ratio = weeklyAvg ? (W.commits/weeklyAvg).toFixed(1) : "-";
+  const repoLine = W.top_repos[0]
+    ? "mostly in " + W.top_repos[0][0] + " (" + Math.round(100*W.top_repos[0][1]/W.commits) + "% of the commits)"
+    : "";
+  document.getElementById("ww-n").textContent = W.commits;
+  document.getElementById("ww-t").textContent =
+    "commits in 7 days, " + ratio + "x your weekly average of " + Math.round(weeklyAvg) +
+    "\n" + W.start + " -> " + W.end +
+    "\n" + repoLine;
+  new Chart(document.getElementById("chart-ww-hours"), { type:"bar", data:{ labels:[...Array(24).keys()].map(h=>h+"h"), datasets:[{ data:W.hours, backgroundColor:"#ff6b6b", borderRadius:3 }]}, options: opt() });
+}
+
+// --- peak month broken down ---
+{
+  const P = D.peak_month;
+  const monthlyAvg = D.span_days ? D.total / (D.span_days/30.4) : 0;
+  const ratio = monthlyAvg ? (P.commits/monthlyAvg).toFixed(1) : "-";
+  const repoPct = P.commits ? Math.round(100 * (P.top_repo_count||0) / P.commits) : 0;
+  const catPct  = P.commits ? Math.round(100 * (P.top_category_count||0) / P.commits) : 0;
+  const overallMed = D.loc && D.loc.size_p50 ? D.loc.size_p50 : 0;
+  const sizeNote = overallMed
+    ? " (your overall median is +" + fmt(overallMed) + ")"
+    : "";
+  document.getElementById("pm-n").textContent = P.commits;
+  document.getElementById("pm-t").textContent =
+    "commits in " + P.label + ", " + ratio + "x your monthly average of " + Math.round(monthlyAvg) +
+    "\nmostly " + (P.top_repo || "n/a") + " (" + repoPct + "% of the commits)" +
+    "\nmedian commit: +" + fmt(P.median_commit_size||0) + " lines" + sizeNote;
+  const catLabel = P.top_category === "other"
+    ? "no conventional prefix (feat/fix/refactor/etc.)"
+    : "'" + P.top_category + "' subjects";
+  const langPart = P.top_language
+    ? "; most lines added were in ." + P.top_language + " files (" + fmt(P.top_language_lines||0) + " lines)"
+    : "";
+  document.getElementById("pm-extra").textContent =
+    "Dominant subject style: " + catLabel + " (" + catPct + "% of the month)" + langPart;
+}
+
+// --- multi-year calendar ---
+(function(){
+  const cal = document.getElementById("cal");
+  const dates = Object.keys(D.all_daily).sort();
+  if (!dates.length) return;
+  const fy = parseInt(dates[0].slice(0,4));
+  const ly = parseInt(dates[dates.length-1].slice(0,4));
+  let mx = 0; for (const v of Object.values(D.all_daily)) if (v>mx) mx = v;
+  for (let y = fy; y <= ly; y++) {
+    const row = document.createElement("div"); row.className="cal-row";
+    const lbl = document.createElement("div"); lbl.className="cal-yr-lbl"; lbl.textContent = y;
+    const grid = document.createElement("div"); grid.className="cal-grid";
+    const yearStart = new Date(y, 0, 1);
+    const yearEnd = new Date(y+1, 0, 1);
+    const startWd = (yearStart.getDay()+6)%7; // Mon=0..Sun=6
+    for (let ts = yearStart.getTime(); ts < yearEnd.getTime(); ts += 86400000) {
+      const dd = new Date(ts);
+      const wd = (dd.getDay()+6)%7;
+      const dayOfYear = Math.round((ts - yearStart.getTime()) / 86400000);
+      const col = Math.floor((dayOfYear + startWd) / 7);
+      const iso = dd.getFullYear() + "-" + String(dd.getMonth()+1).padStart(2,"0") + "-" + String(dd.getDate()).padStart(2,"0");
+      const v = D.all_daily[iso] || 0;
+      const cell = document.createElement("div"); cell.className="cal-cell";
+      const a = mx ? v/mx : 0;
+      cell.style.background = v ? `rgba(124, 196, 255, ${0.10 + a*0.90})` : "#1a2432";
+      cell.style.gridColumn = (col+1);
+      cell.style.gridRow = (wd+1);
+      cell.title = `${iso}: ${v} commits`;
+      grid.appendChild(cell);
+    }
+    row.appendChild(lbl); row.appendChild(grid); cal.appendChild(row);
+  }
+})();
 </script></body></html>
 """
 
@@ -578,6 +1804,9 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=60, help="per-repo git timeout in seconds (default: 60)")
     ap.add_argument("--open", action="store_true", help="open the output in the default browser when done")
     ap.add_argument("--json", default=None, help="also write the raw analysis JSON to this path")
+    ap.add_argument("--blame", action="store_true",
+                    help="run git blame on every file in HEAD to compute code-survival "
+                         "per year. Slow on large trees.")
     args = ap.parse_args()
 
     if shutil.which("git") is None:
@@ -621,8 +1850,28 @@ def main() -> int:
             if done % 10 == 0 or done == len(repos):
                 print(f"  [{done}/{len(repos)}] scanned", file=sys.stderr)
 
+    survival = {}
+    if args.blame:
+        needles = author_needles(pattern)
+        print(f"running blame across {len(repos)} repos (this can be slow)", file=sys.stderr)
+        done = 0
+        with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+            futs = {ex.submit(blame_repo, r, needles, args.timeout): r for r in repos}
+            for fut in cf.as_completed(futs):
+                r = futs[fut]
+                try:
+                    counts = fut.result()
+                except Exception as e:
+                    print(f"  ! blame {r.name}: {e}", file=sys.stderr)
+                    counts = {}
+                for y, n in counts.items():
+                    survival[y] = survival.get(y, 0) + n
+                done += 1
+                if done % 10 == 0 or done == len(repos):
+                    print(f"  [{done}/{len(repos)}] blamed", file=sys.stderr)
+
     print(f"analyzing {len(all_commits)} commit rows, {len(all_loc)} file-changes", file=sys.stderr)
-    data = analyze(all_commits, all_loc, title)
+    data = analyze(all_commits, all_loc, title, survival=survival)
 
     if args.json:
         Path(args.json).write_text(json.dumps(data, indent=2), encoding="utf-8")
