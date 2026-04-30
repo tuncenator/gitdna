@@ -396,6 +396,65 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
     # --- repo Gini ---
     repo_gini_val = round(gini(list(repos.values())), 3)
 
+    # --- timezone migration: modal UTC offset (in hours) per month ---
+    tz_per_month = collections.defaultdict(collections.Counter)
+    for c in commits:
+        off = c[2].utcoffset()
+        if off is None:
+            continue
+        h = off.total_seconds() / 3600.0
+        tz_per_month[(c[2].year, c[2].month)][h] += 1
+    tz_keys = sorted(tz_per_month.keys())
+    tz_labels = [f"{y}-{m:02d}" for y, m in tz_keys]
+    tz_modal = [tz_per_month[k].most_common(1)[0][0] for k in tz_keys]
+    tz_distinct = sorted({h for c in tz_per_month.values() for h in c})
+    # transitions: months where modal differs from previous
+    tz_transitions = []
+    for i in range(1, len(tz_keys)):
+        if tz_modal[i] != tz_modal[i - 1]:
+            tz_transitions.append({
+                "from": tz_labels[i - 1],
+                "to": tz_labels[i],
+                "from_offset": tz_modal[i - 1],
+                "to_offset": tz_modal[i],
+            })
+
+    # --- cold-repo resurrections: per repo, gaps >= 90 days between commits ---
+    per_repo_dates = collections.defaultdict(list)
+    for c in commits:
+        per_repo_dates[c[0]].append(c[2])
+    resurrections = []
+    repo_lifecycle = []  # (repo, first, last, span_days, peak_month, peak_count)
+    for repo, ds in per_repo_dates.items():
+        ds = sorted(ds)
+        first_d = ds[0]
+        last_d = ds[-1]
+        # peak month for this repo
+        m_count = collections.Counter()
+        for d in ds:
+            m_count[(d.year, d.month)] += 1
+        peak_m, peak_n = m_count.most_common(1)[0]
+        repo_lifecycle.append({
+            "repo": repo,
+            "first": first_d.isoformat(),
+            "last": last_d.isoformat(),
+            "span_days": (last_d.date() - first_d.date()).days,
+            "commits": len(ds),
+            "peak": f"{peak_m[0]}-{peak_m[1]:02d}",
+            "peak_count": peak_n,
+        })
+        for i in range(1, len(ds)):
+            gap = (ds[i].date() - ds[i - 1].date()).days
+            if gap >= 90:
+                resurrections.append({
+                    "repo": repo,
+                    "from": ds[i - 1].date().isoformat(),
+                    "to": ds[i].date().isoformat(),
+                    "days": gap,
+                })
+    resurrections.sort(key=lambda r: r["days"], reverse=True)
+    repo_lifecycle.sort(key=lambda r: r["span_days"], reverse=True)
+
     # --- subject classifier: bin each commit subject into one category ---
     SUBJECT_BINS = [
         ("feat",     re.compile(r"^(feat|add|new|introduc|implement|create|support)", re.I)),
@@ -731,6 +790,14 @@ def analyze(commits: list[tuple], loc_rows: list[tuple], title: str) -> dict:
         "coauthor_distinct": len(coauthor_counter),
         "top_coauthors": top_coauthors,
         "identities": identity_rows,
+        "timezone": {
+            "labels": tz_labels,
+            "modal": tz_modal,
+            "distinct": tz_distinct,
+            "transitions": tz_transitions[:20],
+        },
+        "resurrections": resurrections[:25],
+        "repo_lifecycle": repo_lifecycle[:50],
         "loc": {
             "commits_with_data": len(commit_add_raw),
             "total_add_raw": total_add_raw,
